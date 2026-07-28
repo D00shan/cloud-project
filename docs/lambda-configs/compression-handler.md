@@ -3,6 +3,7 @@
 | Setting | Value |
 |---|---|
 | Function name | FileCompressionHandler |
+| ARN | arn:aws:lambda:us-east-1:555751475057:function:FileCompressionHandler |
 | Region | us-east-1 |
 | Runtime | Node.js 24.x |
 | Architecture | x86_64 |
@@ -50,3 +51,4 @@ Run:
 ```bash
 npm install
 npm run package
+```
