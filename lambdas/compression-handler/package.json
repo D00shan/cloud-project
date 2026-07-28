@@ -1,0 +1,14 @@
+{
+  "name": "compression-handler",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "package": "zip -r compression-handler.zip index.js package.json package-lock.json node_modules"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.0.0",
+    "@aws-sdk/lib-storage": "^3.0.0"
+  }
+}

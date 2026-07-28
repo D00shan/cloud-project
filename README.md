@@ -38,7 +38,15 @@ AWS SDK: JavaScript v3
 - Include required IAM permissions with every AWS component.
 - Clearly distinguish console instructions from CLI instructions.
 
-## TODO
-- Document project fully
-- Download AWS cli on my device
-- Document deployment through AWS cli# cloud-project
+# Project TODO
+
+* [x] Rename `index.js` to `index.mjs`
+* [x] Add `package.json` and install the Lambda dependencies
+* [ ] Test the corrected Lambda package locally and in AWS
+* [ ] Copy the current Lambda configuration into the project documentation
+* [ ] Copy all current IAM policies into JSON files
+* [ ] Document the S3 notification and SQS event source mapping
+* [ ] Install AWS CLI v2
+* [ ] Configure the AWS CLI safely
+* [ ] Reproduce the current resources through documented CLI commands
+* [ ] Only then begin the web application
