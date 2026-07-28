@@ -27,7 +27,7 @@ No environment variables are currently configured.
 | Trigger status | Enabled |
 | Batch size | 1 |
 | Batch window | None |
-| Partial batch responses | Disabled |
+| Partial batch responses | Enabled |
 | Maximum concurrency | None |
 
 ## Processing behavior

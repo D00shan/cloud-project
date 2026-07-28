@@ -1,0 +1,38 @@
+{
+	"Version": "2012-10-17",
+	"Statement": [
+		{
+			"Sid": "ListIncomingBucket",
+			"Effect": "Allow",
+			"Action": "s3:ListBucket",
+			"Resource": "arn:aws:s3:::cloud-project-file-sharing-bucket",
+			"Condition": {
+				"StringLike": {
+					"s3:prefix": [
+						"incoming",
+						"incoming/*"
+					]
+				}
+			}
+		},
+		{
+			"Sid": "ReadAndDeleteIncomingFiles",
+			"Effect": "Allow",
+			"Action": [
+				"s3:GetObject",
+				"s3:DeleteObject",
+				"s3:DeleteObjectVersion"
+			],
+			"Resource": "arn:aws:s3:::cloud-project-file-sharing-bucket/incoming/*"
+		},
+		{
+			"Sid": "WriteCompressedFiles",
+			"Effect": "Allow",
+			"Action": [
+				"s3:PutObject",
+				"s3:AbortMultipartUpload"
+			],
+			"Resource": "arn:aws:s3:::cloud-project-file-sharing-bucket/compressed/*"
+		}
+	]
+}
