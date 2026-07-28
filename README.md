@@ -45,8 +45,8 @@ AWS SDK: JavaScript v3
 * [x] Test the corrected Lambda package locally and in AWS
 * [x] Copy the current Lambda configuration into the project documentation
 * [x] Copy all current IAM policies into JSON files
-* [ ] Document the S3 notification and SQS event source mapping
-* [ ] Install AWS CLI v2
-* [ ] Configure the AWS CLI safely
+* [x] Document the S3 notification and SQS event source mapping
+* [x] Install AWS CLI v2
+* [x] Configure the AWS CLI safely
 * [ ] Reproduce the current resources through documented CLI commands
 * [ ] Begin work on the web application
