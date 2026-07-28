@@ -42,8 +42,8 @@ AWS SDK: JavaScript v3
 
 * [x] Rename `index.js` to `index.mjs`
 * [x] Add `package.json` and install the Lambda dependencies
-* [ ] Test the corrected Lambda package locally and in AWS
-* [ ] Copy the current Lambda configuration into the project documentation
+* [x] Test the corrected Lambda package locally and in AWS
+* [x] Copy the current Lambda configuration into the project documentation
 * [ ] Copy all current IAM policies into JSON files
 * [ ] Document the S3 notification and SQS event source mapping
 * [ ] Install AWS CLI v2
