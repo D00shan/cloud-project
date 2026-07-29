@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+CONFIG_FILE="${1:-$SCRIPT_DIR/.env}"
+
+# Prevent AWS CLI from opening output in a pager.
+export AWS_PAGER=""
+
+log "Running infrastructure preflight checks..."
+
+# ---------------------------------------------------------------------------
+# Local configuration and command checks
+# ---------------------------------------------------------------------------
+
+[[ -f "$CONFIG_FILE" ]] \
+  || die "Config file not found: $CONFIG_FILE. Copy config/project.env.example to .env first."
+
+for command_name in aws node npm zip jq; do
+  require_command "$command_name"
+done
+
+AWS_CLI_VERSION="$(aws --version 2>&1)"
+
+[[ "$AWS_CLI_VERSION" == aws-cli/2.* ]] \
+  || die "AWS CLI v2 is required; found: $AWS_CLI_VERSION"
+
+# The configuration file is a local, trusted Bash-style environment file.
+set -a
+
+# shellcheck disable=SC1090
+source "$CONFIG_FILE"
+
+set +a
+
+required_values=(
+  AWS_PROFILE
+  AWS_REGION
+  PROJECT_NAME
+  ENVIRONMENT
+  BUCKET_NAME_PREFIX
+  INCOMING_PREFIX
+  COMPRESSED_PREFIX
+  SQS_QUEUE_NAME
+  SQS_VISIBILITY_TIMEOUT
+  LAMBDA_FUNCTION_NAME
+  LAMBDA_ROLE_NAME
+  LAMBDA_MEMORY_SIZE
+  LAMBDA_TIMEOUT
+)
+
+for variable_name in "${required_values[@]}"; do
+  require_config_value "$variable_name"
+done
+
+# ---------------------------------------------------------------------------
+# Configuration validation
+# ---------------------------------------------------------------------------
+
+[[ "$AWS_REGION" =~ ^[a-z0-9]+(-[a-z0-9]+)+$ ]] \
+  || die "AWS_REGION has an invalid format: $AWS_REGION"
+
+[[ "$PROJECT_NAME" =~ ^[a-z0-9][a-z0-9-]*[a-z0-9]$ ]] \
+  || die "PROJECT_NAME must use lowercase letters, numbers, and hyphens."
+
+[[ "$ENVIRONMENT" =~ ^[a-z0-9][a-z0-9-]*[a-z0-9]$ ]] \
+  || die "ENVIRONMENT must use lowercase letters, numbers, and hyphens."
+
+[[ "$BUCKET_NAME_PREFIX" =~ ^[a-z0-9][a-z0-9-]*[a-z0-9]$ ]] \
+  || die "BUCKET_NAME_PREFIX must use lowercase letters, numbers, and hyphens."
+
+[[ "$SQS_QUEUE_NAME" =~ ^[A-Za-z0-9_-]{1,80}$ ]] \
+  || die "SQS_QUEUE_NAME must be 1-80 characters using letters, numbers, hyphens, or underscores."
+
+[[ "$LAMBDA_FUNCTION_NAME" =~ ^[A-Za-z0-9_-]{1,64}$ ]] \
+  || die "LAMBDA_FUNCTION_NAME must be 1-64 characters using letters, numbers, hyphens, or underscores."
+
+[[ "$LAMBDA_ROLE_NAME" =~ ^[A-Za-z0-9+=,.@_-]{1,64}$ ]] \
+  || die "LAMBDA_ROLE_NAME contains unsupported characters or is longer than 64 characters."
+
+[[ "$INCOMING_PREFIX" != /* && "$INCOMING_PREFIX" == */ ]] \
+  || die "INCOMING_PREFIX must not begin with / and must end with /."
+
+[[ "$COMPRESSED_PREFIX" != /* && "$COMPRESSED_PREFIX" == */ ]] \
+  || die "COMPRESSED_PREFIX must not begin with / and must end with /."
+
+[[ "$INCOMING_PREFIX" != "$COMPRESSED_PREFIX" ]] \
+  || die "INCOMING_PREFIX and COMPRESSED_PREFIX must be different."
+
+require_integer_between SQS_VISIBILITY_TIMEOUT 0 43200
+require_integer_between LAMBDA_MEMORY_SIZE 128 10240
+require_integer_between LAMBDA_TIMEOUT 1 900
+
+minimum_visibility_timeout=$((LAMBDA_TIMEOUT * 6))
+
+(( SQS_VISIBILITY_TIMEOUT >= minimum_visibility_timeout )) \
+  || die "SQS_VISIBILITY_TIMEOUT must be at least six times LAMBDA_TIMEOUT ($minimum_visibility_timeout seconds)."
+
+# ---------------------------------------------------------------------------
+# AWS identity and region checks
+# ---------------------------------------------------------------------------
+
+log "Authenticating with AWS profile '$AWS_PROFILE' in region '$AWS_REGION'..."
+
+if ! IDENTITY_JSON="$(
+  aws \
+    --profile "$AWS_PROFILE" \
+    --region "$AWS_REGION" \
+    sts get-caller-identity \
+    --output json \
+    --no-cli-pager 2>&1
+)"; then
+  die "AWS authentication failed for profile '$AWS_PROFILE': $IDENTITY_JSON"
+fi
+
+ACCOUNT_ID="$(jq -r '.Account // empty' <<<"$IDENTITY_JSON")"
+CALLER_ARN="$(jq -r '.Arn // empty' <<<"$IDENTITY_JSON")"
+
+[[ "$ACCOUNT_ID" =~ ^[0-9]{12}$ ]] \
+  || die "AWS returned an invalid account ID: ${ACCOUNT_ID:-<empty>}"
+
+[[ -n "$CALLER_ARN" ]] \
+  || die "AWS did not return a caller ARN."
+
+# ---------------------------------------------------------------------------
+# Bucket-name generation and validation
+# ---------------------------------------------------------------------------
+
+BUCKET_NAME="${BUCKET_NAME_PREFIX}-${ACCOUNT_ID}-${AWS_REGION}"
+
+(( ${#BUCKET_NAME} >= 3 && ${#BUCKET_NAME} <= 63 )) \
+  || die "Generated bucket name must be 3-63 characters; got ${#BUCKET_NAME}: $BUCKET_NAME"
+
+[[ "$BUCKET_NAME" =~ ^[a-z0-9][a-z0-9.-]*[a-z0-9]$ ]] \
+  || die "Generated bucket name contains invalid characters: $BUCKET_NAME"
+
+[[ "$BUCKET_NAME" != *..* ]] \
+  || die "Generated bucket name cannot contain adjacent periods: $BUCKET_NAME"
+
+[[ ! "$BUCKET_NAME" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] \
+  || die "Generated bucket name cannot look like an IP address: $BUCKET_NAME"
+
+[[ \
+  "$BUCKET_NAME" != xn--* &&
+  "$BUCKET_NAME" != sthree-* &&
+  "$BUCKET_NAME" != amzn-s3-demo-* \
+]] || die "Generated bucket name uses an AWS-reserved prefix: $BUCKET_NAME"
+
+[[ \
+  "$BUCKET_NAME" != *-s3alias &&
+  "$BUCKET_NAME" != *--ol-s3 &&
+  "$BUCKET_NAME" != *.mrap &&
+  "$BUCKET_NAME" != *--x-s3 &&
+  "$BUCKET_NAME" != *--table-s3 \
+]] || die "Generated bucket name uses an AWS-reserved suffix: $BUCKET_NAME"
+
+log "AWS account: $ACCOUNT_ID"
+log "Caller ARN:  $CALLER_ARN"
+log "AWS region:  $AWS_REGION"
+log "Bucket name: $BUCKET_NAME"
+
+# ---------------------------------------------------------------------------
+# Conservative bucket availability check
+# ---------------------------------------------------------------------------
+
+bucket_error_file="$(mktemp)"
+
+trap 'rm -f "$bucket_error_file"' EXIT
+
+if aws \
+  --profile "$AWS_PROFILE" \
+  --region "$AWS_REGION" \
+  s3api head-bucket \
+  --bucket "$BUCKET_NAME" \
+  --no-cli-pager \
+  >/dev/null 2>"$bucket_error_file"; then
+
+  die "Bucket name is already in use and accessible: $BUCKET_NAME"
+fi
+
+bucket_error="$(<"$bucket_error_file")"
+
+if grep -Eq '\(404\)|Not Found|NoSuchBucket' <<<"$bucket_error"; then
+  log "Bucket name appears available in the AWS partition."
+
+elif grep -Eq \
+  '\(400\)|\(403\)|Forbidden|AccessDenied|Bad Request|Moved Permanently' \
+  <<<"$bucket_error"; then
+
+  die "Bucket name is unavailable or AWS cannot prove it is available: $BUCKET_NAME. AWS response: $bucket_error"
+
+else
+  die "Could not determine bucket-name availability. AWS response: $bucket_error"
+fi
+
+log "Preflight passed. No AWS resources were changed."
