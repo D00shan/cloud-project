@@ -9,6 +9,8 @@ import { pipeline } from "node:stream/promises";
 import { createGzip } from "node:zlib";
 
 const s3 = new S3Client({});
+const incomingPrefix = process.env.INCOMING_PREFIX ?? "incoming/";
+const compressedPrefix = process.env.COMPRESSED_PREFIX ?? "compressed/";
 
 /**
  * Decode the URL-encoded key supplied by an S3 event notification.
@@ -42,21 +44,22 @@ async function compressObject(s3Record) {
     sequencer: s3Record.s3.object.sequencer,
   });
 
-  if (!key.startsWith("incoming/")) {
-    console.log("Skipping object outside incoming/", {
+  if (!key.startsWith(incomingPrefix)) {
+    console.log("Skipping object outside configured incoming prefix", {
       bucketName,
       key,
+      incomingPrefix,
     });
 
     return {
       skipped: true,
       bucket: bucketName,
       sourceKey: key,
-      reason: "Object is outside incoming/",
+      reason: `Object is outside ${incomingPrefix}`,
     };
   }
 
-  const fileName = key.slice("incoming/".length);
+  const fileName = key.slice(incomingPrefix.length);
 
   if (!fileName) {
     throw new Error(`Source key does not include a file name: ${key}`);
@@ -77,7 +80,7 @@ async function compressObject(s3Record) {
     };
   }
 
-  const compressedKey = `compressed/${fileName}.gz`;
+  const compressedKey = `${compressedPrefix}${fileName}.gz`;
 
   console.log("Downloading source object", {
     bucketName,

@@ -243,3 +243,125 @@ validate_generated_json_directory() {
   (( generated_file_count > 0 )) \
     || die "No generated JSON files were found in: $generated_directory"
 }
+
+write_json_atomically() {
+  local destination_file="$1"
+  local destination_directory
+  local temporary_file
+
+  destination_directory="$(dirname -- "$destination_file")"
+  mkdir -p "$destination_directory"
+  temporary_file="$(mktemp "$destination_directory/.state.XXXXXX")"
+
+  if ! jq . >"$temporary_file"; then
+    rm -f -- "$temporary_file"
+    die "Refusing to write invalid JSON state: $destination_file"
+  fi
+
+  chmod 600 "$temporary_file"
+  mv "$temporary_file" "$destination_file"
+}
+
+update_json_file_atomically() {
+  local state_file="$1"
+  local jq_filter="$2"
+  shift 2
+  local temporary_file
+
+  [[ -f "$state_file" ]] \
+    || die "State file is missing: $state_file"
+
+  temporary_file="$(mktemp "$(dirname -- "$state_file")/.state.XXXXXX")"
+
+  if ! jq "$@" "$jq_filter" "$state_file" >"$temporary_file"; then
+    rm -f -- "$temporary_file"
+    die "Could not update deployment state: $state_file"
+  fi
+
+  chmod 600 "$temporary_file"
+  mv "$temporary_file" "$state_file"
+}
+
+validate_deployment_state() {
+  local state_file="$1"
+  local account_id="$2"
+  local partition="$3"
+  local region="$4"
+  local profile="$5"
+  local project_name="$6"
+  local environment="$7"
+  local bucket_name="$8"
+  local bucket_arn="$9"
+  local queue_name="${10}"
+  local queue_arn="${11}"
+  local lambda_name="${12}"
+  local lambda_arn="${13}"
+  local role_name="${14}"
+  local role_arn="${15}"
+  local lambda_s3_policy_name="${16}"
+  local lambda_sqs_policy_name="${17}"
+
+  [[ -f "$state_file" ]] \
+    || die "Deployment state is missing: $state_file"
+
+  jq empty "$state_file" >/dev/null 2>&1 \
+    || die "Deployment state is not valid JSON: $state_file"
+
+  jq -e \
+    --arg account_id "$account_id" \
+    --arg partition "$partition" \
+    --arg region "$region" \
+    --arg profile "$profile" \
+    --arg project_name "$project_name" \
+    --arg environment "$environment" \
+    --arg project_identifier "$project_name/$environment" \
+    --arg bucket_name "$bucket_name" \
+    --arg bucket_arn "$bucket_arn" \
+    --arg queue_name "$queue_name" \
+    --arg queue_arn "$queue_arn" \
+    --arg lambda_name "$lambda_name" \
+    --arg lambda_arn "$lambda_arn" \
+    --arg role_name "$role_name" \
+    --arg role_arn "$role_arn" \
+    --arg lambda_s3_policy_name "$lambda_s3_policy_name" \
+    --arg lambda_sqs_policy_name "$lambda_sqs_policy_name" \
+    '
+      .schema_version == 1 and
+      (.deployment_id | type == "string" and length > 0) and
+      .identity.account_id == $account_id and
+      .identity.partition == $partition and
+      .identity.region == $region and
+      .identity.profile == $profile and
+      .identity.project_name == $project_name and
+      .identity.environment == $environment and
+      .identity.project_identifier == $project_identifier and
+      .resources.bucket.name == $bucket_name and
+      .resources.bucket.arn == $bucket_arn and
+      .resources.queue.name == $queue_name and
+      .resources.queue.arn == $queue_arn and
+      .resources.lambda.name == $lambda_name and
+      .resources.lambda.arn == $lambda_arn and
+      .resources.role.name == $role_name and
+      .resources.role.arn == $role_arn and
+      .resources.policies.lambda_s3_name == $lambda_s3_policy_name and
+      .resources.policies.lambda_sqs_name == $lambda_sqs_policy_name
+    ' \
+    "$state_file" >/dev/null \
+    || die "Deployment state does not match the authenticated account, configuration, or deterministic resource names: $state_file"
+}
+
+refuse_resource_collision() {
+  local resource_type="$1"
+  local resource_name="$2"
+  local inspection_command="$3"
+
+  die "Resource collision: $resource_type already exists: $resource_name. This deployment will not adopt, overwrite, or delete it. Inspect it with: $inspection_command"
+}
+
+validate_typed_confirmation() {
+  local provided_confirmation="$1"
+  local expected_confirmation="$2"
+
+  [[ "$provided_confirmation" == "$expected_confirmation" ]] \
+    || die "Confirmation did not match. Expected exactly: $expected_confirmation"
+}

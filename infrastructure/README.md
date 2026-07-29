@@ -20,6 +20,7 @@ names.
 - `destroy.sh` — removes infrastructure in reverse dependency order
 - `preflight.sh` — verifies local dependencies, configuration, AWS identity, selected region, and bucket-name availability without modifying AWS resources
 - `render-templates.sh` — derives identifiers, then renders and validates portable JSON configuration
+- `package-lambda.sh` — installs production dependencies in an isolated staging directory and creates the Lambda ZIP
 
 ## Policy and integration templates
 
@@ -78,3 +79,92 @@ edit the AWS_PROFILE and AWS_REGION if necessary and run:
 
 The original manually created AWS environment is documented separately under
 `docs/current-aws-state/`.
+
+## Package the Lambda
+
+```bash
+./infrastructure/package-lambda.sh
+```
+
+Packaging removes the previous package build, copies the Lambda source into an
+ignored staging directory, runs `npm ci --omit=dev`, creates
+`build/lambda-package/compression-handler.zip`, and verifies that `index.mjs`,
+`package.json`, and `node_modules/` are at the ZIP root. It does not install
+dependencies in the source directory.
+
+## Deploy
+
+> **Safety warning:** Keep the original manually created infrastructure
+> untouched. The first real CLI deployment must use a separate temporary
+> environment and distinct resource names.
+
+After copying and reviewing `.env`, deploy with:
+
+```bash
+./infrastructure/deploy.sh
+```
+
+Deployment runs preflight, renders JSON, packages the Lambda, and then creates
+the private S3 bucket, SQS queue, Lambda execution role, Lambda function, event
+source mapping, and S3 notification in dependency order. It attaches the
+AWS-managed `AWSLambdaBasicExecutionRole` policy and adds the two rendered
+least-privilege application policies as inline role policies.
+
+Generated JSON is stored under `build/generated-config/`, the Lambda ZIP under
+`build/lambda-package/`, and deployment ownership state under
+`state/deployment.json`. All are ignored by Git.
+
+### Idempotency and collisions
+
+The first implementation is deliberately conservative:
+
+- An empty deterministic namespace can be deployed.
+- Before the first resource mutation, all deterministic S3, SQS, IAM, and
+  Lambda names are checked for collisions.
+- An unrelated or ambiguous existing resource causes a clear refusal. The
+  deployment never adopts, overwrites, or deletes it.
+- State is written atomically before resource creation and after each tagged
+  resource is recorded.
+- A rerun may continue only when state matches the authenticated account,
+  partition, region, profile, project, environment, and every deterministic
+  resource name.
+- Existing resources are reused only when state records their creation and
+  their `DeploymentId`, `Project`, and `Environment` ownership tags match.
+- Recorded configuration steps may be reapplied to those proven-owned
+  resources. This is interruption recovery, not general reconciliation.
+
+If deployment stops, keep `state/deployment.json`. Inspect the reported
+resource, correct the underlying issue, and rerun the same command with the same
+configuration. If a resource was created but could not be tagged and recorded,
+the script refuses to adopt it; inspect and resolve that collision manually
+instead of deleting anything automatically.
+
+## Destroy
+
+Interactive teardown:
+
+```bash
+./infrastructure/destroy.sh
+```
+
+For automation, the exact configured project/environment identifier is still
+required:
+
+```bash
+./infrastructure/destroy.sh --yes 'cloud-file-compression/cli-test'
+```
+
+Teardown requires valid state, authenticates with the state profile and region,
+re-derives every deterministic name, verifies account/configuration equality,
+and checks ownership tags before showing the plan. It then requires the exact
+project/environment confirmation.
+
+Resources are removed in reverse dependency order: event-source mapping, S3
+notification, Lambda function, role policies and role, SQS queue, multipart
+uploads and bucket objects/versions when applicable, and finally the S3 bucket.
+Local state is removed only after every cleanup step succeeds. On partial
+failure, state is preserved and the script prints recovery guidance.
+
+Neither deployment nor destruction accepts resource names as command-line
+targets. This prevents arbitrary resources—including the historical stack—from
+being selected without matching state created by this deployment system.

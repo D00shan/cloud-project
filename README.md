@@ -53,9 +53,9 @@ AWS SDK: JavaScript v3
 * [x] Create portable IAM policy templates
 * [x] Create portable SQS and S3 configuration templates
 * [x] Add template rendering and JSON validation
-* [ ] Add repeatable Lambda packaging automation
-* [ ] Implement the AWS CLI deployment steps in dependency order
-* [ ] Implement guarded AWS CLI teardown steps in reverse order
+* [x] Add repeatable Lambda packaging automation
+* [x] Implement the AWS CLI deployment steps in dependency order
+* [x] Implement guarded AWS CLI teardown steps in reverse order
 * [ ] Document deployment, testing, troubleshooting, and teardown
 * [ ] Deploy and test a parallel clean stack
 * [ ] Destroy and recreate the parallel stack to prove reproducibility

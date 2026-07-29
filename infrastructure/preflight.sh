@@ -49,6 +49,7 @@ required_values=(
   SQS_VISIBILITY_TIMEOUT
   LAMBDA_FUNCTION_NAME
   LAMBDA_ROLE_NAME
+  LAMBDA_RUNTIME
   LAMBDA_MEMORY_SIZE
   LAMBDA_TIMEOUT
 )
@@ -80,6 +81,9 @@ validate_aws_region "$AWS_REGION"
 
 [[ "$LAMBDA_ROLE_NAME" =~ ^[A-Za-z0-9+=,.@_-]{1,64}$ ]] \
   || die "LAMBDA_ROLE_NAME contains unsupported characters or is longer than 64 characters."
+
+[[ "$LAMBDA_RUNTIME" =~ ^nodejs[0-9]+\.x$ ]] \
+  || die "LAMBDA_RUNTIME must be an AWS Node.js runtime such as nodejs22.x."
 
 validate_object_prefixes "$INCOMING_PREFIX" "$COMPRESSED_PREFIX"
 
@@ -145,7 +149,14 @@ if aws \
   --no-cli-pager \
   >/dev/null 2>"$bucket_error_file"; then
 
-  die "Bucket name is already in use and accessible: $BUCKET_NAME"
+  if [[ "${PREFLIGHT_ALLOW_CONFIGURED_BUCKET:-0}" == "1" ]]; then
+    log "Configured bucket already exists and is accessible; deployment state must prove ownership."
+  else
+    die "Bucket name is already in use and accessible: $BUCKET_NAME"
+  fi
+
+  log "Preflight passed. No AWS resources were changed."
+  exit 0
 fi
 
 bucket_error="$(<"$bucket_error_file")"
