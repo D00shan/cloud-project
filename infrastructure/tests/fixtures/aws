@@ -51,7 +51,7 @@ arguments=("$@")
 
 for (( index=0; index < ${#arguments[@]}; index++ )); do
   case "${arguments[$index]}" in
-    sts|s3api|sqs|iam|lambda|s3)
+    sts|s3api|sqs|iam|lambda|logs|s3)
       service="${arguments[$index]}"
       operation="${arguments[$((index + 1))]:-}"
       break
@@ -76,6 +76,7 @@ queue_name="$(option_value --queue-name "$@" || true)"
 role_name="$(option_value --role-name "$@" || true)"
 function_name="$(option_value --function-name "$@" || true)"
 policy_name="$(option_value --policy-name "$@" || true)"
+object_key="$(option_value --key "$@" || true)"
 
 json_file_value() {
   local value="$1"
@@ -141,7 +142,65 @@ case "$service:$operation" in
     fi
     ;;
   s3api:get-bucket-notification-configuration)
-    jq -c '.bucket.notification // {}' "$MOCK_AWS_STATE_FILE"
+    if [[ "${PHASE4_SCENARIO:-}" == "wrong-notification" ]]; then
+      jq -nc --arg arn "arn:$partition:sqs:$region:$account_id:wrong-queue" \
+        '{QueueConfigurations:[{QueueArn:$arn,Events:["s3:ObjectCreated:*"],Filter:{Key:{FilterRules:[{Name:"prefix",Value:"incoming/"}]}}}]}'
+    else
+      jq -c '.bucket.notification // {}' "$MOCK_AWS_STATE_FILE"
+    fi
+    ;;
+  s3api:get-public-access-block)
+    if [[ "${PHASE4_SCENARIO:-}" == "public-access" ]]; then
+      printf '{"PublicAccessBlockConfiguration":{"BlockPublicAcls":true,"IgnorePublicAcls":true,"BlockPublicPolicy":false,"RestrictPublicBuckets":true}}\n'
+    else
+      printf '{"PublicAccessBlockConfiguration":{"BlockPublicAcls":true,"IgnorePublicAcls":true,"BlockPublicPolicy":true,"RestrictPublicBuckets":true}}\n'
+    fi
+    ;;
+  s3api:get-bucket-ownership-controls)
+    printf '{"OwnershipControls":{"Rules":[{"ObjectOwnership":"BucketOwnerEnforced"}]}}\n'
+    ;;
+  s3api:get-bucket-encryption)
+    printf '{"ServerSideEncryptionConfiguration":{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}}\n'
+    ;;
+  s3api:get-bucket-policy-status)
+    printf '{"PolicyStatus":{"IsPublic":false}}\n'
+    ;;
+  s3api:head-object)
+    if [[ "${PHASE4_SCENARIO:-}" == "unexpected-aws-error" ]]; then
+      printf 'AccessDenied: injected object lookup failure\n' >&2
+      exit 77
+    fi
+    object_kind="$(jq -r --arg key "$object_key" \
+      '.validation.objects[$key].kind // empty' "$MOCK_AWS_STATE_FILE")"
+    if [[ "$object_kind" == "source" ]]; then
+      if [[ "$(jq -r --arg key "$object_key" \
+        '.validation.objects[$key].present // false' "$MOCK_AWS_STATE_FILE")" == true ]]; then
+        printf '{}\n'
+        exit 0
+      fi
+    elif [[ "$object_kind" == "destination" ]]; then
+      polls="$(jq -r --arg key "$object_key" \
+        '.validation.objects[$key].polls // 0' "$MOCK_AWS_STATE_FILE")"
+      object_present="$(jq -r --arg key "$object_key" \
+        '.validation.objects[$key].present // false' "$MOCK_AWS_STATE_FILE")"
+      if [[ "$object_present" == true &&
+            "${PHASE4_SCENARIO:-}" != "compressed-timeout" &&
+            "$polls" -ge 1 ]]; then
+        printf '{}\n'
+        exit 0
+      fi
+      state_update \
+        '.validation.objects[$key].polls += 1' \
+        --arg key "$object_key"
+    fi
+    printf 'An error occurred (404) when calling HeadObject: Not Found\n' >&2
+    exit 255
+    ;;
+  s3api:delete-object)
+    state_update \
+      '.validation.objects[$key].present = false |
+       .validation.deleted_keys += [$key]' \
+      --arg key "$object_key"
     ;;
   s3api:put-bucket-notification-configuration)
     notification="$(option_value --notification-configuration "$@")"
@@ -162,6 +221,57 @@ case "$service:$operation" in
     ;;
 
   s3:rm)
+    ;;
+  s3:cp)
+    service_index=0
+    for (( index=0; index < ${#arguments[@]}; index++ )); do
+      [[ "${arguments[$index]}" == "s3" ]] && { service_index=$index; break; }
+    done
+    source_path="${arguments[$((service_index + 2))]}"
+    destination_path="${arguments[$((service_index + 3))]}"
+    object_directory="${MOCK_AWS_OBJECT_DIR:-${MOCK_AWS_STATE_FILE}.objects}"
+    mkdir -p "$object_directory"
+    if [[ "$destination_path" == s3://* ]]; then
+      s3_tail="${destination_path#s3://}"
+      uploaded_key="${s3_tail#*/}"
+      relative_path="${uploaded_key#incoming/}"
+      compressed_key="compressed/$relative_path.gz"
+      object_hash="$(printf '%s' "$compressed_key" | sha256sum | awk '{print $1}')"
+      output_file="$object_directory/$object_hash"
+      case "${PHASE4_SCENARIO:-}" in
+        invalid-gzip)
+          cp "$source_path" "$output_file"
+          ;;
+        content-mismatch)
+          printf 'different content\n' | gzip -c >"$output_file"
+          ;;
+        *)
+          gzip -c "$source_path" >"$output_file"
+          ;;
+      esac
+      source_present=false
+      [[ "${PHASE4_SCENARIO:-}" == "source-not-deleted" ]] && source_present=true
+      state_update \
+        '.validation.objects[$source] = {kind:"source",present:$source_present,polls:0} |
+         .validation.objects[$destination] = {
+           kind:"destination",present:true,polls:0,file:$file
+         } |
+         .validation.uploaded_keys += [$source]' \
+        --arg source "$uploaded_key" \
+        --arg destination "$compressed_key" \
+        --arg file "$output_file" \
+        --argjson source_present "$source_present"
+    else
+      s3_tail="${source_path#s3://}"
+      download_key="${s3_tail#*/}"
+      output_file="$(jq -r --arg key "$download_key" \
+        '.validation.objects[$key].file // empty' "$MOCK_AWS_STATE_FILE")"
+      [[ -f "$output_file" ]] || {
+        printf 'NoSuchKey\n' >&2
+        exit 254
+      }
+      cp "$output_file" "$destination_path"
+    fi
     ;;
 
   sqs:get-queue-url)
@@ -189,10 +299,14 @@ case "$service:$operation" in
   sqs:get-queue-attributes)
     jq -c \
       --arg arn "${MOCK_QUEUE_ARN:-arn:$partition:sqs:$region:$account_id:$(jq -r '.queue.name' "$MOCK_AWS_STATE_FILE")}" \
+      --arg scenario "${PHASE4_SCENARIO:-}" \
       '{Attributes:{
         QueueArn:$arn,
         VisibilityTimeout:(.queue.visibility_timeout // "180"),
-        Policy:(.queue.policy // "")
+        Policy:(.queue.policy // ""),
+        ApproximateNumberOfMessages:(if $scenario == "queue-nonempty" then "1" else "0" end),
+        ApproximateNumberOfMessagesNotVisible:"0",
+        ApproximateNumberOfMessagesDelayed:"0"
       }}' "$MOCK_AWS_STATE_FILE"
     ;;
   sqs:set-queue-attributes)
@@ -238,7 +352,11 @@ case "$service:$operation" in
   iam:list-attached-role-policies)
     jq -c \
       --arg arn "arn:$partition:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole" \
-      '{AttachedPolicies:(if .role.logging_policy then [{PolicyName:"AWSLambdaBasicExecutionRole",PolicyArn:$arn}] else [] end)}' \
+      --arg scenario "${PHASE4_SCENARIO:-}" \
+      '{AttachedPolicies:(
+        (if .role.logging_policy then [{PolicyName:"AWSLambdaBasicExecutionRole",PolicyArn:$arn}] else [] end) +
+        (if $scenario == "unexpected-iam-policy" then [{PolicyName:"Unexpected",PolicyArn:"arn:aws:iam::aws:policy/AdministratorAccess"}] else [] end)
+      )}' \
       "$MOCK_AWS_STATE_FILE"
     ;;
   iam:list-role-policies)
@@ -319,7 +437,11 @@ case "$service:$operation" in
       printf 'ResourceNotFoundException\n' >&2
       exit 254
     fi
-    jq -c '.lambda.function' "$MOCK_AWS_STATE_FILE"
+    jq -c \
+      '.lambda.function |
+       .Configuration.State = "Active" |
+       .Configuration.LastUpdateStatus = "Successful"' \
+      "$MOCK_AWS_STATE_FILE"
     ;;
   lambda:create-function)
     tags="$(option_value --tags "$@")"
@@ -417,9 +539,15 @@ case "$service:$operation" in
       fi
       printf '%s\n' "$mapping_state"
     else
-      jq -c \
-        '.mapping.configuration + {State:.mapping.state}' \
-        "$MOCK_AWS_STATE_FILE"
+      if [[ "${PHASE4_SCENARIO:-}" == "wrong-mapping" ]]; then
+        jq -c \
+          '.mapping.configuration + {State:.mapping.state,BatchSize:2}' \
+          "$MOCK_AWS_STATE_FILE"
+      else
+        jq -c \
+          '.mapping.configuration + {State:.mapping.state}' \
+          "$MOCK_AWS_STATE_FILE"
+      fi
     fi
     ;;
   lambda:update-event-source-mapping)
@@ -432,6 +560,25 @@ case "$service:$operation" in
     ;;
   lambda:delete-function)
     state_update '.lambda.exists = false'
+    ;;
+
+  logs:filter-log-events)
+    if [[ "${PHASE4_SCENARIO:-}" == "logs-access-denied" ]]; then
+      printf 'AccessDenied: logs:FilterLogEvents is not authorized\n' >&2
+      exit 77
+    fi
+    filter_pattern="$(option_value --filter-pattern "$@" || true)"
+    run_id="${filter_pattern//\"/}"
+    if [[ "${PHASE4_SCENARIO:-}" == "logs-error" ]]; then
+      jq -nc --arg run "$run_id" \
+        '{events:[
+          {message:("File compression invocation completed " + $run)},
+          {message:("SQS message processing failed " + $run)}
+        ]}'
+    else
+      jq -nc --arg run "$run_id" \
+        '{events:[{message:("File compression invocation completed " + $run)}]}'
+    fi
     ;;
 
   *)

@@ -22,6 +22,9 @@ names.
 - `render-templates.sh` — derives identifiers, then renders and validates portable JSON configuration
 - `package-lambda.sh` — installs production dependencies in an isolated staging directory and creates the Lambda ZIP
 
+Detailed operator documentation is indexed in
+[`docs/README.md`](docs/README.md).
+
 ## Policy and integration templates
 
 Files in `config/templates/` are portable source documents:
@@ -111,6 +114,21 @@ After copying and reviewing `.env`, deploy with:
 ```bash
 ./infrastructure/deploy.sh
 ```
+
+The complete portable rehearsal workflow is:
+
+```bash
+cp infrastructure/config/project.env.example infrastructure/.env
+# edit infrastructure/.env
+./test.sh
+./infrastructure/preflight.sh
+./infrastructure/deploy.sh
+./infrastructure/validate.sh
+./infrastructure/destroy.sh
+```
+
+Use separate temporary names, confirm teardown, and repeat deploy, validation,
+and destruction from empty state. Do not modify the original stack.
 
 Deployment runs preflight, renders JSON, packages the Lambda, and then creates
 the private S3 bucket, SQS queue, Lambda execution role, Lambda function, event

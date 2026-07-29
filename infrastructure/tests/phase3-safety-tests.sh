@@ -93,7 +93,8 @@ initialize_mock_state() {
       state:"Deleted",
       state_queries_remaining:0,
       configuration:{}
-    }
+    },
+    validation:{objects:{},uploaded_keys:[],deleted_keys:[]}
   }' >"$state_file"
 }
 

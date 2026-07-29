@@ -38,6 +38,28 @@ AWS SDK: JavaScript v3
 - Include required IAM permissions with every AWS component.
 - Clearly distinguish console instructions from CLI instructions.
 
+## Portable AWS CLI workflow
+
+Keep the original working stack untouched. Configure distinct names for a
+parallel disposable rehearsal:
+
+```bash
+cp infrastructure/config/project.env.example infrastructure/.env
+# edit infrastructure/.env
+
+./test.sh
+./infrastructure/preflight.sh
+./infrastructure/deploy.sh
+./infrastructure/validate.sh
+./infrastructure/destroy.sh
+```
+
+After confirming the temporary resources and state are gone, deploy, validate,
+and destroy the same configuration a second time from empty state. Detailed
+beginner guides and the uncompleted rehearsal evidence checklist are indexed in
+[infrastructure/docs/README.md](infrastructure/docs/README.md). Local tests do
+not prove real AWS portability; only two successful disposable AWS cycles do.
+
 # Project TODO
 
 * [x] Rename `index.js` to `index.mjs`
@@ -56,8 +78,8 @@ AWS SDK: JavaScript v3
 * [x] Add repeatable Lambda packaging automation
 * [x] Implement the AWS CLI deployment steps in dependency order
 * [x] Implement guarded AWS CLI teardown steps in reverse order
-* [ ] Document deployment, testing, troubleshooting, and teardown
+* [x] Document deployment, testing, troubleshooting, and teardown
 * [ ] Deploy and test a parallel clean stack
 * [ ] Destroy and recreate the parallel stack to prove reproducibility
-* [ ] Review the portable files for account-specific identifiers
+* [x] Review the portable files for account-specific identifiers
 * [ ] Begin work on the web application
