@@ -132,6 +132,16 @@ The first implementation is deliberately conservative:
   their `DeploymentId`, `Project`, and `Environment` ownership tags match.
 - Recorded configuration steps may be reapplied to those proven-owned
   resources. This is interruption recovery, not general reconciliation.
+- The initial deployment records a normalized configuration fingerprint and
+  the exact Lambda ZIP SHA-256 hash. The configuration fingerprint also covers
+  every rendered policy/notification document and fixed Lambda handler,
+  architecture, and S3 safety settings. A rerun proceeds only when both hashes
+  still match. Changed Lambda code, runtime, handler-related settings, memory,
+  timeout, prefixes, queue visibility timeout, templates, or other recorded
+  configuration causes a refusal before any AWS mutation.
+- When a fingerprint differs, destroy the parallel temporary stack using its
+  original configuration and deploy it again. The script never silently leaves
+  AWS running a mixture of old and new configuration.
 
 If deployment stops, keep `state/deployment.json`. Inspect the reported
 resource, correct the underlying issue, and rerun the same command with the same
@@ -162,9 +172,27 @@ project/environment confirmation.
 Resources are removed in reverse dependency order: event-source mapping, S3
 notification, Lambda function, role policies and role, SQS queue, multipart
 uploads and bucket objects/versions when applicable, and finally the S3 bucket.
+After role ownership tags are verified, teardown independently detaches the
+managed logging policy and deletes both expected inline policies. Already
+missing policies are accepted; authorization and other unexpected AWS errors
+remain fatal. This makes cleanup safe when deployment stopped between IAM
+operations and its state checkpoint.
 Local state is removed only after every cleanup step succeeds. On partial
 failure, state is preserved and the script prints recovery guidance.
 
 Neither deployment nor destruction accepts resource names as command-line
 targets. This prevents arbitrary resources—including the historical stack—from
 being selected without matching state created by this deployment system.
+
+## Phase 3 local safety tests
+
+Run the isolated AWS CLI simulator suite with:
+
+```bash
+./infrastructure/tests/phase3-safety-tests.sh
+```
+
+The suite uses temporary repository copies and a local AWS mock. It exercises a
+fresh deployment, an unchanged rerun, configuration/code drift refusal, IAM
+crash recovery, missing-policy cleanup, fatal authorization errors, ownership
+refusal, shell syntax, and template JSON without using real AWS credentials.

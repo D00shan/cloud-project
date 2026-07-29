@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Phase 3 simulator waiters transition immediately.
+exit 0

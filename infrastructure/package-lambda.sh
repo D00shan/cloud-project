@@ -43,9 +43,20 @@ log "Installing production Lambda dependencies with npm ci..."
 [[ -d "$STAGING_DIR/node_modules" ]] \
   || die "npm ci did not create the required node_modules directory."
 
+# Normalize timestamps and archive ordering so identical source and lockfile
+# inputs produce an identical ZIP hash. deploy.sh uses that hash as part of its
+# conservative rerun safety gate.
+NORMALIZED_PACKAGE_TIMESTAMP='19800101''0000'
+find "$STAGING_DIR" -exec touch -t "$NORMALIZED_PACKAGE_TIMESTAMP" {} +
+
 (
   cd "$STAGING_DIR"
-  zip -qr "$ZIP_FILE" index.mjs package.json package-lock.json node_modules
+  {
+    printf '%s\n' index.mjs package.json package-lock.json
+    find node_modules \( -type f -o -type l \) -print
+  } \
+    | LC_ALL=C sort \
+    | zip -q -y "$ZIP_FILE" -@
 )
 
 [[ -f "$ZIP_FILE" ]] \

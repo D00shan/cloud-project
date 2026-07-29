@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if [[ "${1:-}" == "--version" ]]; then
+  printf '%s\n' 'aws-cli/2.99.0 Python/3.99.0 Linux/mock'
+  exit 0
+fi
+
+: "${MOCK_AWS_STATE_FILE:?MOCK_AWS_STATE_FILE is required}"
+: "${MOCK_AWS_LOG_FILE:?MOCK_AWS_LOG_FILE is required}"
+
+default_account_id="$(printf '%012d' 123456)"
+account_id="${MOCK_AWS_ACCOUNT_ID:-$default_account_id}"
+partition="${MOCK_AWS_PARTITION:-aws}"
+region="${MOCK_AWS_REGION:-us-east-1}"
+
+option_value() {
+  local expected_option="$1"
+  shift
+  local argument
+  local return_next=false
+
+  for argument in "$@"; do
+    if [[ "$return_next" == true ]]; then
+      printf '%s' "$argument"
+      return 0
+    fi
+
+    [[ "$argument" == "$expected_option" ]] && return_next=true
+  done
+
+  return 1
+}
+
+service=""
+operation=""
+arguments=("$@")
+
+for (( index=0; index < ${#arguments[@]}; index++ )); do
+  case "${arguments[$index]}" in
+    sts|s3api|sqs|iam|lambda|s3)
+      service="${arguments[$index]}"
+      operation="${arguments[$((index + 1))]:-}"
+      break
+      ;;
+  esac
+done
+
+[[ -n "$service" && -n "$operation" ]] \
+  || { printf 'Unsupported mock AWS command: %s\n' "$*" >&2; exit 64; }
+
+printf '%s %s\n' "$service" "$operation" >>"$MOCK_AWS_LOG_FILE"
+
+state_update() {
+  local filter="$1"
+  shift
+  local temporary_file="${MOCK_AWS_STATE_FILE}.tmp"
+  jq "$@" "$filter" "$MOCK_AWS_STATE_FILE" >"$temporary_file"
+  mv "$temporary_file" "$MOCK_AWS_STATE_FILE"
+}
+
+queue_name="$(option_value --queue-name "$@" || true)"
+role_name="$(option_value --role-name "$@" || true)"
+function_name="$(option_value --function-name "$@" || true)"
+policy_name="$(option_value --policy-name "$@" || true)"
+
+case "$service:$operation" in
+  sts:get-caller-identity)
+    jq -nc \
+      --arg account "$account_id" \
+      --arg arn "arn:$partition:sts::$account_id:assumed-role/Phase3SafetyTest/local" \
+      '{UserId:"phase3-test",Account:$account,Arn:$arn}'
+    ;;
+
+  s3api:head-bucket)
+    if [[ "$(jq -r '.bucket.exists' "$MOCK_AWS_STATE_FILE")" == true ]]; then
+      exit 0
+    fi
+    printf 'An error occurred (404) when calling HeadBucket: Not Found\n' >&2
+    exit 255
+    ;;
+  s3api:create-bucket)
+    state_update '.bucket.exists = true'
+    printf '{}\n'
+    ;;
+  s3api:wait|s3api:put-bucket-ownership-controls|s3api:put-public-access-block|s3api:put-bucket-encryption)
+    ;;
+  s3api:put-bucket-tagging)
+    tagging="$(option_value --tagging "$@")"
+    state_update '.bucket.tags = $tags' --argjson tags "$(jq -c '.TagSet' <<<"$tagging")"
+    ;;
+  s3api:get-bucket-tagging)
+    jq -c '{TagSet:.bucket.tags}' "$MOCK_AWS_STATE_FILE"
+    ;;
+  s3api:put-bucket-notification-configuration)
+    state_update '.bucket.notification = true'
+    ;;
+  s3api:list-multipart-uploads)
+    printf '{"Uploads":[]}\n'
+    ;;
+  s3api:get-bucket-versioning)
+    printf 'None\n'
+    ;;
+  s3api:delete-bucket)
+    state_update '.bucket.exists = false'
+    ;;
+
+  s3:rm)
+    ;;
+
+  sqs:get-queue-url)
+    if [[ "$(jq -r '.queue.exists' "$MOCK_AWS_STATE_FILE")" != true ]]; then
+      printf 'AWS.SimpleQueueService.NonExistentQueue\n' >&2
+      exit 254
+    fi
+    jq -nc \
+      --arg url "https://sqs.$region.amazonaws.com/$account_id/$queue_name" \
+      '{QueueUrl:$url}'
+    ;;
+  sqs:create-queue)
+    tags="$(option_value --tags "$@")"
+    state_update \
+      '.queue.exists = true | .queue.tags = $tags' \
+      --argjson tags "$tags"
+    jq -nc \
+      --arg url "https://sqs.$region.amazonaws.com/$account_id/$queue_name" \
+      '{QueueUrl:$url}'
+    ;;
+  sqs:get-queue-attributes)
+    jq -nc \
+      --arg arn "arn:$partition:sqs:$region:$account_id:$(jq -r '.queue.name' "$MOCK_AWS_STATE_FILE")" \
+      '{Attributes:{QueueArn:$arn}}'
+    ;;
+  sqs:set-queue-attributes)
+    state_update '.queue.attributes_applied = true'
+    ;;
+  sqs:list-queue-tags)
+    jq -c '{Tags:.queue.tags}' "$MOCK_AWS_STATE_FILE"
+    ;;
+  sqs:delete-queue)
+    state_update '.queue.exists = false'
+    ;;
+
+  iam:get-role)
+    if [[ "$(jq -r '.role.exists' "$MOCK_AWS_STATE_FILE")" != true ]]; then
+      printf 'NoSuchEntity\n' >&2
+      exit 254
+    fi
+    jq -nc \
+      --arg arn "arn:$partition:iam::$account_id:role/$role_name" \
+      '{Role:{Arn:$arn}}'
+    ;;
+  iam:create-role)
+    tags="$(option_value --tags "$@")"
+    state_update \
+      '.role.exists = true | .role.tags = $tags' \
+      --argjson tags "$tags"
+    jq -nc \
+      --arg arn "arn:$partition:iam::$account_id:role/$role_name" \
+      '{Role:{Arn:$arn}}'
+    ;;
+  iam:list-role-tags)
+    jq -c '{Tags:.role.tags}' "$MOCK_AWS_STATE_FILE"
+    ;;
+  iam:attach-role-policy)
+    if [[ "${MOCK_FAIL_POINT:-}" == "before-managed-policy" ]]; then
+      printf 'Injected failure before managed policy attachment\n' >&2
+      exit 70
+    fi
+    state_update '.role.logging_policy = true'
+    if [[ "${MOCK_FAIL_POINT:-}" == "after-managed-policy" ]]; then
+      printf 'Injected failure after managed policy attachment\n' >&2
+      exit 71
+    fi
+    ;;
+  iam:put-role-policy)
+    if [[ "$policy_name" == *-s3-access ]]; then
+      state_update '.role.s3_policy = true'
+      if [[ "${MOCK_FAIL_POINT:-}" == "after-s3-inline-policy" ]]; then
+        printf 'Injected failure after S3 inline policy\n' >&2
+        exit 72
+      fi
+    else
+      state_update '.role.sqs_policy = true'
+    fi
+    ;;
+  iam:wait)
+    ;;
+  iam:detach-role-policy)
+    if [[ "${MOCK_IAM_CLEANUP_ACCESS_DENIED:-0}" == 1 ]]; then
+      printf 'AccessDenied: not authorized to detach policy\n' >&2
+      exit 77
+    fi
+    if [[ "$(jq -r '.role.logging_policy' "$MOCK_AWS_STATE_FILE")" != true ]]; then
+      printf 'NoSuchEntity: policy attachment does not exist\n' >&2
+      exit 254
+    fi
+    state_update '.role.logging_policy = false'
+    ;;
+  iam:delete-role-policy)
+    policy_key="sqs_policy"
+    [[ "$policy_name" == *-s3-access ]] && policy_key="s3_policy"
+    if [[ "$(jq -r ".role.$policy_key" "$MOCK_AWS_STATE_FILE")" != true ]]; then
+      printf 'NoSuchEntity: inline policy does not exist\n' >&2
+      exit 254
+    fi
+    state_update ".role.$policy_key = false"
+    ;;
+  iam:delete-role)
+    if jq -e '.role.logging_policy or .role.s3_policy or .role.sqs_policy' \
+      "$MOCK_AWS_STATE_FILE" >/dev/null; then
+      printf 'DeleteConflict: policies remain attached\n' >&2
+      exit 75
+    fi
+    state_update '.role.exists = false'
+    ;;
+
+  lambda:get-function)
+    if [[ "$(jq -r '.lambda.exists' "$MOCK_AWS_STATE_FILE")" != true ]]; then
+      printf 'ResourceNotFoundException\n' >&2
+      exit 254
+    fi
+    jq -nc \
+      --arg arn "arn:$partition:lambda:$region:$account_id:function:$function_name" \
+      '{Configuration:{FunctionArn:$arn}}'
+    ;;
+  lambda:create-function)
+    tags="$(option_value --tags "$@")"
+    state_update \
+      '.lambda.exists = true | .lambda.tags = $tags' \
+      --argjson tags "$tags"
+    jq -nc \
+      --arg arn "arn:$partition:lambda:$region:$account_id:function:$function_name" \
+      '{FunctionArn:$arn}'
+    ;;
+  lambda:list-tags)
+    jq -c '{Tags:.lambda.tags}' "$MOCK_AWS_STATE_FILE"
+    ;;
+  lambda:wait)
+    ;;
+  lambda:get-function-configuration)
+    printf '{"State":"Active","LastUpdateStatus":"Successful"}\n'
+    ;;
+  lambda:list-event-source-mappings)
+    if [[ "$(jq -r '.mapping.exists' "$MOCK_AWS_STATE_FILE")" == true ]]; then
+      printf '{"EventSourceMappings":[{"UUID":"phase3-test-mapping"}]}\n'
+    else
+      printf '{"EventSourceMappings":[]}\n'
+    fi
+    ;;
+  lambda:create-event-source-mapping)
+    state_update '.mapping.exists = true | .mapping.enabled = true'
+    printf '{"UUID":"phase3-test-mapping"}\n'
+    ;;
+  lambda:get-event-source-mapping)
+    if [[ " $* " == *" --query State "* ]]; then
+      if [[ "$(jq -r '.mapping.enabled' "$MOCK_AWS_STATE_FILE")" == false ]]; then
+        printf 'Disabled\n'
+      else
+        printf 'Enabled\n'
+      fi
+    else
+      jq -nc \
+        --arg queue_arn "arn:$partition:sqs:$region:$account_id:$(jq -r '.queue.name' "$MOCK_AWS_STATE_FILE")" \
+        --arg function_arn "arn:$partition:lambda:$region:$account_id:function:$(jq -r '.lambda.name' "$MOCK_AWS_STATE_FILE")" \
+        '{UUID:"phase3-test-mapping",EventSourceArn:$queue_arn,FunctionArn:$function_arn}'
+    fi
+    ;;
+  lambda:update-event-source-mapping)
+    state_update '.mapping.enabled = false'
+    printf '{}\n'
+    ;;
+  lambda:delete-event-source-mapping)
+    state_update '.mapping.exists = false'
+    printf '{}\n'
+    ;;
+  lambda:delete-function)
+    state_update '.lambda.exists = false'
+    ;;
+
+  *)
+    printf 'Unsupported mock AWS command: %s %s (%s)\n' "$service" "$operation" "$*" >&2
+    exit 64
+    ;;
+esac

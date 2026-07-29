@@ -248,6 +248,24 @@ update_destroy_state() {
   update_json_file_atomically "$STATE_FILE" "$jq_filter" "$@"
 }
 
+iam_cleanup_allow_missing() {
+  local description="$1"
+  shift
+  local command_output
+
+  if command_output="$(aws "$@" 2>&1)"; then
+    log "$description"
+    return 0
+  fi
+
+  if grep -Eq 'NoSuchEntity' <<<"$command_output"; then
+    log "$description (already absent)"
+    return 0
+  fi
+
+  die "$description failed. AWS response: $command_output"
+}
+
 update_destroy_state \
   '.deployment_status = "destroying" |
    .destruction_started_at = $started_at' \
@@ -320,32 +338,38 @@ if [[ "$(jq -r '.resources.lambda.created' "$STATE_FILE")" == true ]]; then
 fi
 
 if [[ "$(jq -r '.resources.role.created' "$STATE_FILE")" == true ]]; then
-  log "Removing Lambda role policies..."
+  log "Removing expected Lambda role policies independently..."
 
-  if [[ "$(jq -r '.steps.role_policies_applied' "$STATE_FILE")" == true ]]; then
-    aws \
-      --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-      iam detach-role-policy \
-      --role-name "$LAMBDA_ROLE_NAME" \
-      --policy-arn "$LOGGING_POLICY_ARN" \
-      --no-cli-pager
+  # Do not trust the aggregate role_policies_applied flag here. An AWS policy
+  # call may have succeeded immediately before deploy.sh crashed and before
+  # state was checkpointed. Ownership tags were already verified above, so
+  # independently remove each expected policy and tolerate only "already
+  # absent" responses.
+  iam_cleanup_allow_missing \
+    "Detached managed Lambda logging policy" \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+    iam detach-role-policy \
+    --role-name "$LAMBDA_ROLE_NAME" \
+    --policy-arn "$LOGGING_POLICY_ARN" \
+    --no-cli-pager
 
-    aws \
-      --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-      iam delete-role-policy \
-      --role-name "$LAMBDA_ROLE_NAME" \
-      --policy-name "$LAMBDA_S3_POLICY_NAME" \
-      --no-cli-pager
+  iam_cleanup_allow_missing \
+    "Deleted inline Lambda S3 policy" \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+    iam delete-role-policy \
+    --role-name "$LAMBDA_ROLE_NAME" \
+    --policy-name "$LAMBDA_S3_POLICY_NAME" \
+    --no-cli-pager
 
-    aws \
-      --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-      iam delete-role-policy \
-      --role-name "$LAMBDA_ROLE_NAME" \
-      --policy-name "$LAMBDA_SQS_POLICY_NAME" \
-      --no-cli-pager
+  iam_cleanup_allow_missing \
+    "Deleted inline Lambda SQS policy" \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+    iam delete-role-policy \
+    --role-name "$LAMBDA_ROLE_NAME" \
+    --policy-name "$LAMBDA_SQS_POLICY_NAME" \
+    --no-cli-pager
 
-    update_destroy_state '.steps.role_policies_applied = false'
-  fi
+  update_destroy_state '.steps.role_policies_applied = false'
 
   aws \
     --profile "$AWS_PROFILE" --region "$AWS_REGION" \

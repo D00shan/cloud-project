@@ -44,7 +44,7 @@ for variable_name in "${required_values[@]}"; do
   require_config_value "$variable_name"
 done
 
-for command_name in aws jq npm zip unzip; do
+for command_name in aws jq npm zip unzip sha256sum; do
   require_command "$command_name"
 done
 
@@ -97,6 +97,8 @@ LAMBDA_ROLE_ARN="arn:$AWS_PARTITION:iam::$ACCOUNT_ID:role/$LAMBDA_ROLE_NAME"
 LAMBDA_S3_POLICY_NAME="$LAMBDA_ROLE_NAME-s3-access"
 LAMBDA_SQS_POLICY_NAME="$LAMBDA_ROLE_NAME-sqs-access"
 LOGGING_POLICY_ARN="arn:$AWS_PARTITION:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+LAMBDA_HANDLER="index.handler"
+LAMBDA_ARCHITECTURE="x86_64"
 
 validate_bucket_name "$BUCKET_NAME"
 validate_bucket_arn_consistency "$BUCKET_ARN" "$AWS_PARTITION" "$BUCKET_NAME"
@@ -416,6 +418,90 @@ log "Rendering deployment JSON before any resource mutation..."
 log "Building Lambda deployment package..."
 "$SCRIPT_DIR/package-lambda.sh"
 
+# Conservative rerun policy:
+# This script reapplies only configuration that is known to be safe on
+# proven-owned resources; it is not a complete reconciler. Record a normalized
+# configuration fingerprint and the exact Lambda package hash on first deploy.
+# A rerun must match both values before the first AWS mutation, otherwise the
+# temporary stack must be destroyed and recreated.
+normalized_deployment_configuration="$(
+  GENERATED_CONFIGURATION_SHA256="$(
+    (
+      cd "$GENERATED_DIR"
+      sha256sum ./*.json
+    ) | sha256sum | awk '{print $1}'
+  )"
+
+  jq -ncS \
+    --arg aws_profile "$AWS_PROFILE" \
+    --arg aws_region "$AWS_REGION" \
+    --arg project_name "$PROJECT_NAME" \
+    --arg environment "$ENVIRONMENT" \
+    --arg bucket_name_prefix "$BUCKET_NAME_PREFIX" \
+    --arg incoming_prefix "$INCOMING_PREFIX" \
+    --arg compressed_prefix "$COMPRESSED_PREFIX" \
+    --arg sqs_queue_name "$SQS_QUEUE_NAME" \
+    --arg sqs_visibility_timeout "$SQS_VISIBILITY_TIMEOUT" \
+    --arg lambda_function_name "$LAMBDA_FUNCTION_NAME" \
+    --arg lambda_role_name "$LAMBDA_ROLE_NAME" \
+    --arg lambda_runtime "$LAMBDA_RUNTIME" \
+    --arg lambda_handler "$LAMBDA_HANDLER" \
+    --arg lambda_architecture "$LAMBDA_ARCHITECTURE" \
+    --arg lambda_memory_size "$LAMBDA_MEMORY_SIZE" \
+    --arg lambda_timeout "$LAMBDA_TIMEOUT" \
+    --arg generated_configuration_sha256 "$GENERATED_CONFIGURATION_SHA256" \
+    '{
+      aws_profile:$aws_profile,
+      aws_region:$aws_region,
+      project_name:$project_name,
+      environment:$environment,
+      bucket_name_prefix:$bucket_name_prefix,
+      incoming_prefix:$incoming_prefix,
+      compressed_prefix:$compressed_prefix,
+      sqs_queue_name:$sqs_queue_name,
+      sqs_visibility_timeout:$sqs_visibility_timeout,
+      lambda_function_name:$lambda_function_name,
+      lambda_role_name:$lambda_role_name,
+      lambda_runtime:$lambda_runtime,
+      lambda_handler:$lambda_handler,
+      lambda_architecture:$lambda_architecture,
+      lambda_memory_size:$lambda_memory_size,
+      lambda_timeout:$lambda_timeout,
+      generated_configuration_sha256:$generated_configuration_sha256,
+      s3_object_ownership:"BucketOwnerEnforced",
+      s3_public_access_block:"all-blocked",
+      s3_default_encryption:"AES256"
+    }'
+)"
+
+CONFIGURATION_FINGERPRINT="$(
+  sha256sum <<<"$normalized_deployment_configuration" | awk '{print $1}'
+)"
+LAMBDA_PACKAGE_SHA256="$(sha256sum "$ZIP_FILE" | awk '{print $1}')"
+
+if [[ "$RESUMING" == true ]]; then
+  recorded_configuration_fingerprint="$(
+    jq -r '.deployment_configuration_fingerprint // empty' "$STATE_FILE"
+  )"
+  recorded_lambda_package_sha256="$(
+    jq -r '.lambda_package_sha256 // empty' "$STATE_FILE"
+  )"
+
+  [[ -n "$recorded_configuration_fingerprint" ]] \
+    || die "Existing state predates the rerun fingerprint policy. Destroy the temporary stack with the recorded configuration, then deploy it again."
+
+  [[ "$CONFIGURATION_FINGERPRINT" == "$recorded_configuration_fingerprint" ]] \
+    || die "Deployment configuration changed since this stack was created. Refusing a partial reconciliation. Destroy the temporary stack with ./infrastructure/destroy.sh, then deploy it again."
+
+  [[ -n "$recorded_lambda_package_sha256" ]] \
+    || die "Existing state does not record a Lambda package hash. Destroy the temporary stack, then deploy it again."
+
+  [[ "$LAMBDA_PACKAGE_SHA256" == "$recorded_lambda_package_sha256" ]] \
+    || die "Lambda package content changed since this stack was created. Refusing to leave mixed code/configuration. Destroy the temporary stack with ./infrastructure/destroy.sh, then deploy it again."
+
+  log "Rerun fingerprints match recorded deployment configuration and Lambda package."
+fi
+
 if [[ ! -f "$STATE_FILE" ]]; then
   jq -n \
     --arg deployment_id "$DEPLOYMENT_ID" \
@@ -438,11 +524,15 @@ if [[ ! -f "$STATE_FILE" ]]; then
     --arg lambda_s3_policy_name "$LAMBDA_S3_POLICY_NAME" \
     --arg lambda_sqs_policy_name "$LAMBDA_SQS_POLICY_NAME" \
     --arg logging_policy_arn "$LOGGING_POLICY_ARN" \
+    --arg deployment_configuration_fingerprint "$CONFIGURATION_FINGERPRINT" \
+    --arg lambda_package_sha256 "$LAMBDA_PACKAGE_SHA256" \
     '{
       schema_version: 1,
       deployment_id: $deployment_id,
       deployment_status: "deploying",
       deployed_at: $deployed_at,
+      deployment_configuration_fingerprint: $deployment_configuration_fingerprint,
+      lambda_package_sha256: $lambda_package_sha256,
       identity: {
         account_id: $account_id,
         partition: $partition,
@@ -710,13 +800,13 @@ if [[ "$(state_flag '.resources.lambda.created')" != true ]]; then
         --function-name "$LAMBDA_FUNCTION_NAME" \
         --runtime "$LAMBDA_RUNTIME" \
         --role "$LAMBDA_ROLE_ARN" \
-        --handler index.handler \
+        --handler "$LAMBDA_HANDLER" \
         --zip-file "fileb://$ZIP_FILE" \
         --timeout "$LAMBDA_TIMEOUT" \
         --memory-size "$LAMBDA_MEMORY_SIZE" \
         --environment "$lambda_environment" \
         --tags "$lambda_tags" \
-        --architectures x86_64 \
+        --architectures "$LAMBDA_ARCHITECTURE" \
         --output json --no-cli-pager 2>&1
     )"; then
       break
