@@ -2,6 +2,7 @@ import {
   S3Client,
   GetObjectCommand,
   DeleteObjectCommand,
+  HeadObjectCommand,
 } from "@aws-sdk/client-s3";
 
 import { Upload } from "@aws-sdk/lib-storage";
@@ -12,23 +13,59 @@ const s3 = new S3Client({});
 const incomingPrefix = process.env.INCOMING_PREFIX ?? "incoming/";
 const compressedPrefix = process.env.COMPRESSED_PREFIX ?? "compressed/";
 
-/**
- * Decode the URL-encoded key supplied by an S3 event notification.
- *
- * S3 represents spaces as "+" in event notification object keys,
- * so "+" must first be converted to a space before decodeURIComponent().
- */
 function decodeS3Key(encodedKey) {
   return decodeURIComponent(encodedKey.replace(/\+/g, " "));
 }
 
-async function compressObject(s3Record) {
+function normalizeETag(eTag) {
+  return String(eTag ?? "")
+    .trim()
+    .replace(/^"+|"+$/g, "")
+    .toLowerCase();
+}
+
+function isNotFoundError(error) {
+  return (
+    error?.name === "NotFound" ||
+    error?.name === "NoSuchKey" ||
+    error?.Code === "NoSuchKey" ||
+    error?.$metadata?.httpStatusCode === 404
+  );
+}
+
+function sourceMetadata(bucketName, key, eTag, versionId) {
+  return {
+    "source-bucket": bucketName,
+    "source-key": encodeURIComponent(key),
+    "source-etag": normalizeETag(eTag),
+    ...(versionId
+      ? { "source-version-id": encodeURIComponent(versionId) }
+      : {}),
+  };
+}
+
+function metadataMatches(actualMetadata, expectedMetadata) {
+  const normalizedActual = Object.fromEntries(
+    Object.entries(actualMetadata ?? {}).map(([key, value]) => [
+      key.toLowerCase(),
+      String(value),
+    ])
+  );
+
+  return Object.entries(expectedMetadata).every(
+    ([key, value]) => normalizedActual[key] === value
+  );
+}
+
+async function compressObject(s3Record, { s3Client, UploadClass }) {
   const bucketName = s3Record?.s3?.bucket?.name;
   const encodedKey = s3Record?.s3?.object?.key;
+  const eventETag = normalizeETag(s3Record?.s3?.object?.eTag);
+  const eventVersionId = s3Record?.s3?.object?.versionId;
 
-  if (!bucketName || !encodedKey) {
+  if (!bucketName || !encodedKey || !eventETag) {
     throw new Error(
-      "The S3 event must contain s3.bucket.name and s3.object.key."
+      "The S3 event must contain s3.bucket.name, s3.object.key, and s3.object.eTag."
     );
   }
 
@@ -40,17 +77,11 @@ async function compressObject(s3Record) {
     bucketName,
     key,
     objectSize: s3Record.s3.object.size,
-    eTag: s3Record.s3.object.eTag,
+    eTag: eventETag,
     sequencer: s3Record.s3.object.sequencer,
   });
 
   if (!key.startsWith(incomingPrefix)) {
-    console.log("Skipping object outside configured incoming prefix", {
-      bucketName,
-      key,
-      incomingPrefix,
-    });
-
     return {
       skipped: true,
       bucket: bucketName,
@@ -65,13 +96,7 @@ async function compressObject(s3Record) {
     throw new Error(`Source key does not include a file name: ${key}`);
   }
 
-  // Avoid accidentally processing directory placeholder objects.
   if (key.endsWith("/")) {
-    console.log("Skipping directory placeholder object", {
-      bucketName,
-      key,
-    });
-
     return {
       skipped: true,
       bucket: bucketName,
@@ -81,42 +106,117 @@ async function compressObject(s3Record) {
   }
 
   const compressedKey = `${compressedPrefix}${fileName}.gz`;
-
-  console.log("Downloading source object", {
+  const expectedMetadata = sourceMetadata(
     bucketName,
     key,
-    compressedKey,
-  });
-
-  const response = await s3.send(
-    new GetObjectCommand({
-      Bucket: bucketName,
-      Key: key,
-    })
+    eventETag,
+    eventVersionId
   );
+
+  async function headCompressedObject() {
+    try {
+      return await s3Client.send(
+        new HeadObjectCommand({
+          Bucket: bucketName,
+          Key: compressedKey,
+        })
+      );
+    } catch (error) {
+      if (isNotFoundError(error)) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  async function deleteSourceObject() {
+    return s3Client.send(
+      new DeleteObjectCommand({
+        Bucket: bucketName,
+        Key: key,
+      })
+    );
+  }
+
+  const existingDestination = await headCompressedObject();
+
+  if (existingDestination) {
+    if (!metadataMatches(existingDestination.Metadata, expectedMetadata)) {
+      throw new Error(
+        `Compressed destination already exists for a different source object: s3://${bucketName}/${compressedKey}`
+      );
+    }
+
+    await deleteSourceObject();
+
+    return {
+      skipped: false,
+      alreadyProcessed: true,
+      bucket: bucketName,
+      deletedSourceKey: key,
+      compressedKey,
+    };
+  }
+
+  let response;
+
+  try {
+    response = await s3Client.send(
+      new GetObjectCommand({
+        Bucket: bucketName,
+        Key: key,
+      })
+    );
+  } catch (error) {
+    if (!isNotFoundError(error)) {
+      throw error;
+    }
+
+    const destinationAfterMissingSource = await headCompressedObject();
+
+    if (
+      destinationAfterMissingSource &&
+      metadataMatches(
+        destinationAfterMissingSource.Metadata,
+        expectedMetadata
+      )
+    ) {
+      return {
+        skipped: false,
+        alreadyProcessed: true,
+        bucket: bucketName,
+        deletedSourceKey: key,
+        compressedKey,
+      };
+    }
+
+    throw new Error(
+      `Source object is missing and no matching compressed destination proves prior success: s3://${bucketName}/${key}`
+    );
+  }
 
   if (!response.Body) {
     throw new Error(`Object body is empty: s3://${bucketName}/${key}`);
   }
 
-  console.log("Source object downloaded", {
-    bucketName,
-    key,
-    versionId: response.VersionId ?? "versioning-disabled",
-  });
+  const downloadedETag = normalizeETag(response.ETag ?? eventETag);
+
+  if (downloadedETag !== eventETag) {
+    throw new Error(
+      `Downloaded source ETag does not match the S3 event for s3://${bucketName}/${key}`
+    );
+  }
 
   const gzipStream = createGzip();
 
-  const upload = new Upload({
-    client: s3,
+  const upload = new UploadClass({
+    client: s3Client,
     params: {
       Bucket: bucketName,
       Key: compressedKey,
       Body: gzipStream,
       ContentType: "application/gzip",
-      Metadata: {
-        "source-key": key,
-      },
+      Metadata: expectedMetadata,
     },
     partSize: 5 * 1024 * 1024,
     queueSize: 2,
@@ -128,125 +228,85 @@ async function compressObject(s3Record) {
     upload.done(),
   ]);
 
-  console.log("Compressed upload completed", {
-    bucketName,
-    sourceKey: key,
-    compressedKey,
-  });
-
-  const deleteParams = {
-    Bucket: bucketName,
-    Key: key,
-  };
-
-  console.log("Source file deletion started", deleteParams);
-
-  const deleteResult = await s3.send(
-    new DeleteObjectCommand(deleteParams)
-  );
-
-  console.log("Source file deletion completed", {
-    bucketName,
-    deletedSourceKey: key,
-    deleteMarker: deleteResult.DeleteMarker,
-    deletedVersionId: deleteResult.VersionId,
-  });
+  const deleteResult = await deleteSourceObject();
 
   return {
     skipped: false,
+    alreadyProcessed: false,
     bucket: bucketName,
     deletedSourceKey: key,
-    deletedVersionId: response.VersionId,
+    deletedVersionId: deleteResult.VersionId,
     compressedKey,
   };
 }
 
-export const handler = async (event, context) => {
-  console.log("File compression invocation started", {
-    requestId: context?.awsRequestId,
-    sqsRecordCount: event?.Records?.length ?? 0,
-  });
+export function createHandler({
+  s3Client = s3,
+  UploadClass = Upload,
+} = {}) {
+  return async (event, context) => {
+    console.log("File compression invocation started", {
+      requestId: context?.awsRequestId,
+      sqsRecordCount: event?.Records?.length ?? 0,
+    });
 
-  const batchItemFailures = [];
-  const results = [];
+    const batchItemFailures = [];
+    const results = [];
 
-  for (const sqsRecord of event?.Records ?? []) {
-    try {
-      console.log("Processing SQS message", {
-        messageId: sqsRecord.messageId,
-        eventSource: sqsRecord.eventSource,
-      });
+    for (const sqsRecord of event?.Records ?? []) {
+      try {
+        const s3Message = JSON.parse(sqsRecord.body);
 
-      const s3Message = JSON.parse(sqsRecord.body);
+        if (s3Message.Event === "s3:TestEvent") {
+          continue;
+        }
 
-      /*
-       * S3 can send an s3:TestEvent when the event notification
-       * configuration is created. It does not use the normal
-       * { Records: [...] } structure.
-       */
-      if (s3Message.Event === "s3:TestEvent") {
-        console.log("Ignoring S3 test event", {
+        if (!Array.isArray(s3Message.Records)) {
+          throw new Error(
+            "SQS message body does not contain an S3 Records array."
+          );
+        }
+
+        for (const s3Record of s3Message.Records) {
+          if (s3Record.eventSource !== "aws:s3") {
+            continue;
+          }
+
+          if (!s3Record.eventName?.startsWith("ObjectCreated:")) {
+            continue;
+          }
+
+          const result = await compressObject(s3Record, {
+            s3Client,
+            UploadClass,
+          });
+          results.push(result);
+        }
+      } catch (error) {
+        console.error("SQS message processing failed", {
           messageId: sqsRecord.messageId,
-          bucket: s3Message.Bucket,
+          name: error?.name,
+          message: error?.message,
+          code: error?.Code ?? error?.code,
+          stack: error?.stack,
         });
 
-        continue;
+        batchItemFailures.push({
+          itemIdentifier: sqsRecord.messageId,
+        });
       }
-
-      if (!Array.isArray(s3Message.Records)) {
-        throw new Error(
-          "SQS message body does not contain an S3 Records array."
-        );
-      }
-
-      for (const s3Record of s3Message.Records) {
-        if (s3Record.eventSource !== "aws:s3") {
-          console.log("Skipping non-S3 record", {
-            eventSource: s3Record.eventSource,
-          });
-
-          continue;
-        }
-
-        if (!s3Record.eventName?.startsWith("ObjectCreated:")) {
-          console.log("Skipping non-object-created event", {
-            eventName: s3Record.eventName,
-          });
-
-          continue;
-        }
-
-        const result = await compressObject(s3Record);
-        results.push(result);
-      }
-    } catch (error) {
-      console.error("SQS message processing failed", {
-        messageId: sqsRecord.messageId,
-        name: error?.name,
-        message: error?.message,
-        code: error?.Code ?? error?.code,
-        stack: error?.stack,
-      });
-
-      /*
-       * Mark only this SQS message as failed.
-       *
-       * Lambda must have ReportBatchItemFailures enabled on the
-       * SQS event source mapping for this response to take effect.
-       */
-      batchItemFailures.push({
-        itemIdentifier: sqsRecord.messageId,
-      });
     }
-  }
 
-  console.log("File compression invocation completed", {
-    successfulObjectCount: results.length,
-    failedMessageCount: batchItemFailures.length,
-    results,
-  });
+    console.log("File compression invocation completed", {
+      successfulObjectCount: results.length,
+      failedMessageCount: batchItemFailures.length,
+      results,
+    });
 
-  return {
-    batchItemFailures,
+    return {
+      batchItemFailures,
+    };
   };
-};
+}
+
+export const handler = createHandler();

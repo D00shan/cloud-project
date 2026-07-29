@@ -150,74 +150,169 @@ verify_tag_map() {
     <<<"$json" >/dev/null
 }
 
-log "Verifying ownership tags before showing any destructive plan..."
+update_destroy_state() {
+  local jq_filter="$1"
+  shift
+  update_json_file_atomically "$STATE_FILE" "$jq_filter" "$@"
+}
+
+lookup_or_absent() {
+  local absent_pattern="$1"
+  local description="$2"
+  shift 2
+  local output
+
+  if output="$(aws "$@" 2>&1)"; then
+    printf '%s' "$output"
+    return 0
+  fi
+  if grep -Eq "$absent_pattern" <<<"$output"; then
+    return 1
+  fi
+  printf '%s lookup failed; refusing to infer absence. AWS response: %s\n' \
+    "$description" "$output" >&2
+  return 2
+}
+
+log "Verifying existence and ownership before showing any destructive plan..."
+
+if [[ -n "$EVENT_SOURCE_MAPPING_UUID" ]]; then
+  if mapping_json="$(lookup_or_absent \
+    'ResourceNotFoundException' "Event-source mapping" \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+    lambda get-event-source-mapping --uuid "$EVENT_SOURCE_MAPPING_UUID" \
+    --output json --no-cli-pager)"; then
+    jq -e \
+      --arg queue_arn "$QUEUE_ARN" \
+      --arg function_arn "$LAMBDA_FUNCTION_ARN" \
+      '.EventSourceArn == $queue_arn and
+       (.FunctionArn == $function_arn or .FunctionArn == ($function_arn + ":$LATEST"))' \
+      <<<"$mapping_json" >/dev/null \
+      || die "Event-source mapping does not target the recorded queue and function."
+  else
+    lookup_status=$?
+    (( lookup_status == 1 )) \
+      || die "Event-source mapping lookup failed; refusing to infer absence; no resources were deleted."
+    log "Event-source mapping is already absent; checkpointing state."
+    update_destroy_state \
+      '.resources.event_source_mapping_uuid = "" |
+       .steps.event_source_mapping_enabled = false'
+    EVENT_SOURCE_MAPPING_UUID=""
+  fi
+fi
 
 if [[ "$(jq -r '.resources.bucket.created' "$STATE_FILE")" == true ]]; then
-  bucket_tags="$(
-    aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-      s3api get-bucket-tagging --bucket "$BUCKET_NAME" \
-      --output json --no-cli-pager
-  )"
-  verify_tag_array "$bucket_tags" '.TagSet' \
-    || die "S3 bucket ownership tags do not match deployment state: $BUCKET_NAME"
+  if lookup_or_absent \
+    '(^|[^0-9])404([^0-9]|$)|NoSuchBucket' "S3 bucket" \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+    s3api head-bucket --bucket "$BUCKET_NAME" --no-cli-pager >/dev/null; then
+    bucket_tags="$(
+      aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+        s3api get-bucket-tagging --bucket "$BUCKET_NAME" \
+        --output json --no-cli-pager
+    )"
+    verify_tag_array "$bucket_tags" '.TagSet' \
+      || die "S3 bucket ownership tags do not match deployment state: $BUCKET_NAME"
+  else
+    lookup_status=$?
+    (( lookup_status == 1 )) \
+      || die "S3 bucket lookup failed; refusing to infer absence; no resources were deleted."
+    log "S3 bucket is already absent; checkpointing state."
+    update_destroy_state \
+      '.resources.bucket.created = false |
+       .steps.bucket_configured = false |
+       .steps.s3_notification_applied = false'
+  fi
 fi
 
 if [[ "$(jq -r '.resources.queue.created' "$STATE_FILE")" == true ]]; then
   [[ -n "$QUEUE_URL" ]] || die "State does not contain the recorded queue URL."
 
-  queue_lookup_json="$(
-    aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-      sqs get-queue-url --queue-name "$SQS_QUEUE_NAME" \
-      --output json --no-cli-pager
-  )"
-
-  actual_queue_url="$(jq -r '.QueueUrl // empty' <<<"$queue_lookup_json")"
-  [[ "$actual_queue_url" == "$QUEUE_URL" ]] \
-    || die "Recorded SQS queue URL does not match the configured queue name."
-
-  queue_tags="$(
-    aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-      sqs list-queue-tags --queue-url "$QUEUE_URL" \
-      --output json --no-cli-pager
-  )"
-  verify_tag_map "$queue_tags" '.Tags' \
-    || die "SQS queue ownership tags do not match deployment state: $SQS_QUEUE_NAME"
+  if queue_lookup_json="$(lookup_or_absent \
+    'NonExistentQueue|QueueDoesNotExist' "SQS queue" \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+    sqs get-queue-url --queue-name "$SQS_QUEUE_NAME" \
+    --output json --no-cli-pager)"; then
+    actual_queue_url="$(jq -r '.QueueUrl // empty' <<<"$queue_lookup_json")"
+    [[ "$actual_queue_url" == "$QUEUE_URL" ]] \
+      || die "Recorded SQS queue URL does not match the configured queue name."
+    queue_attributes="$(
+      aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+        sqs get-queue-attributes --queue-url "$QUEUE_URL" \
+        --attribute-names QueueArn --output json --no-cli-pager
+    )"
+    [[ "$(jq -r '.Attributes.QueueArn // empty' <<<"$queue_attributes")" == "$QUEUE_ARN" ]] \
+      || die "SQS queue ARN does not match deployment state."
+    queue_tags="$(
+      aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+        sqs list-queue-tags --queue-url "$QUEUE_URL" \
+        --output json --no-cli-pager
+    )"
+    verify_tag_map "$queue_tags" '.Tags' \
+      || die "SQS queue ownership tags do not match deployment state: $SQS_QUEUE_NAME"
+  else
+    lookup_status=$?
+    (( lookup_status == 1 )) \
+      || die "SQS queue lookup failed; refusing to infer absence; no resources were deleted."
+    log "SQS queue is already absent; checkpointing state."
+    update_destroy_state \
+      '.resources.queue.created = false |
+       .resources.queue.url = "" |
+       .steps.queue_policy_applied = false'
+    QUEUE_URL=""
+  fi
 fi
 
 if [[ "$(jq -r '.resources.role.created' "$STATE_FILE")" == true ]]; then
-  role_tags="$(
-    aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-      iam list-role-tags --role-name "$LAMBDA_ROLE_NAME" \
-      --output json --no-cli-pager
-  )"
-  verify_tag_array "$role_tags" '.Tags' \
-    || die "IAM role ownership tags do not match deployment state: $LAMBDA_ROLE_NAME"
+  if role_json="$(lookup_or_absent \
+    'NoSuchEntity' "IAM role" \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+    iam get-role --role-name "$LAMBDA_ROLE_NAME" \
+    --output json --no-cli-pager)"; then
+    [[ "$(jq -r '.Role.Arn // empty' <<<"$role_json")" == "$LAMBDA_ROLE_ARN" ]] \
+      || die "IAM role ARN does not match deployment state."
+    role_tags="$(
+      aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+        iam list-role-tags --role-name "$LAMBDA_ROLE_NAME" \
+        --output json --no-cli-pager
+    )"
+    verify_tag_array "$role_tags" '.Tags' \
+      || die "IAM role ownership tags do not match deployment state: $LAMBDA_ROLE_NAME"
+  else
+    lookup_status=$?
+    (( lookup_status == 1 )) \
+      || die "IAM role lookup failed; refusing to infer absence; no resources were deleted."
+    log "IAM role is already absent; checkpointing state."
+    update_destroy_state \
+      '.resources.role.created = false |
+       .steps.role_policies_applied = false'
+  fi
 fi
 
 if [[ "$(jq -r '.resources.lambda.created' "$STATE_FILE")" == true ]]; then
-  function_tags="$(
-    aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-      lambda list-tags --resource "$LAMBDA_FUNCTION_ARN" \
-      --output json --no-cli-pager
-  )"
-  verify_tag_map "$function_tags" '.Tags' \
-    || die "Lambda ownership tags do not match deployment state: $LAMBDA_FUNCTION_NAME"
-fi
-
-if [[ -n "$EVENT_SOURCE_MAPPING_UUID" ]]; then
-  mapping_json="$(
-    aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-      lambda get-event-source-mapping --uuid "$EVENT_SOURCE_MAPPING_UUID" \
-      --output json --no-cli-pager
-  )"
-
-  jq -e \
-    --arg queue_arn "$QUEUE_ARN" \
-    --arg function_arn "$LAMBDA_FUNCTION_ARN" \
-    '.EventSourceArn == $queue_arn and
-     (.FunctionArn == $function_arn or .FunctionArn == ($function_arn + ":$LATEST"))' \
-    <<<"$mapping_json" >/dev/null \
-    || die "Event-source mapping does not target the recorded queue and function."
+  if function_json="$(lookup_or_absent \
+    'ResourceNotFoundException' "Lambda function" \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+    lambda get-function --function-name "$LAMBDA_FUNCTION_NAME" \
+    --output json --no-cli-pager)"; then
+    [[ "$(jq -r '.Configuration.FunctionArn // empty' <<<"$function_json")" == "$LAMBDA_FUNCTION_ARN" ]] \
+      || die "Lambda ARN does not match deployment state."
+    function_tags="$(
+      aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+        lambda list-tags --resource "$LAMBDA_FUNCTION_ARN" \
+        --output json --no-cli-pager
+    )"
+    verify_tag_map "$function_tags" '.Tags' \
+      || die "Lambda ownership tags do not match deployment state: $LAMBDA_FUNCTION_NAME"
+  else
+    lookup_status=$?
+    (( lookup_status == 1 )) \
+      || die "Lambda function lookup failed; refusing to infer absence; no resources were deleted."
+    log "Lambda function is already absent; checkpointing state."
+    update_destroy_state \
+      '.resources.lambda.created = false |
+       .steps.lambda_ready = false'
+  fi
 fi
 
 printf '%s\n' \
@@ -241,12 +336,6 @@ else
     "$typed_confirmation" \
     "$PROJECT_IDENTIFIER"
 fi
-
-update_destroy_state() {
-  local jq_filter="$1"
-  shift
-  update_json_file_atomically "$STATE_FILE" "$jq_filter" "$@"
-}
 
 iam_cleanup_allow_missing() {
   local description="$1"

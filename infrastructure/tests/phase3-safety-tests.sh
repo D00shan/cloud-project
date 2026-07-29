@@ -7,6 +7,10 @@ PROJECT_ROOT="$(cd -- "$INFRASTRUCTURE_DIR/.." && pwd)"
 TEST_ROOT="$(mktemp -d)"
 
 cleanup() {
+  if [[ "${KEEP_PHASE3_TEST_ROOT:-0}" == 1 ]]; then
+    printf 'Preserved test workspace: %s\n' "$TEST_ROOT" >&2
+    return
+  fi
   rm -rf -- "$TEST_ROOT"
 }
 
@@ -55,15 +59,18 @@ initialize_mock_state() {
   local state_file="$1"
 
   jq -n '{
-    bucket:{exists:false,tags:[],notification:false},
+    bucket:{exists:false,tags:[],notification:{}},
     queue:{
       exists:false,
       name:"cloud-file-compression-cli-test-queue",
       tags:{},
+      policy:"",
+      visibility_timeout:"180",
       attributes_applied:false
     },
     role:{
       exists:false,
+      name:"cloud-file-compression-cli-test-role",
       tags:[],
       logging_policy:false,
       s3_policy:false,
@@ -72,9 +79,10 @@ initialize_mock_state() {
     lambda:{
       exists:false,
       name:"cloud-file-compression-cli-test-handler",
-      tags:{}
+      tags:{},
+      function:{}
     },
-    mapping:{exists:false,enabled:false}
+    mapping:{exists:false,enabled:false,configuration:{}}
   }' >"$state_file"
 }
 
@@ -262,7 +270,169 @@ jq -e '.role.exists and .bucket.exists and .queue.exists' \
   "$workspace/mock-aws-state.json" >/dev/null
 printf '   PASS\n'
 
-printf '8. Bash and JSON validation...\n'
+printf '8. Interrupted creations are adopted only after exact verification...\n'
+for recovery_case in \
+  bucket:create-bucket \
+  queue:create-queue \
+  role:create-role \
+  lambda:create-function \
+  mapping:create-event-source-mapping \
+  notification:put-bucket-notification-configuration; do
+  fail_point="${recovery_case%%:*}"
+  creation_operation="${recovery_case#*:}"
+  workspace="$(new_workspace "adopt-$fail_point")"
+  initialize_mock_state "$workspace/mock-aws-state.json"
+  : >"$workspace/mock-aws.log"
+  assert_failure "$workspace/interrupted.out" \
+    run_deploy "$workspace" MOCK_FAIL_POINT="$fail_point"
+  creation_count_before="$(
+    grep -c "$creation_operation" "$workspace/mock-aws.log" || true
+  )"
+  run_deploy "$workspace" >"$workspace/recovery.out"
+  creation_count_after="$(
+    grep -c "$creation_operation" "$workspace/mock-aws.log" || true
+  )"
+  [[ "$creation_count_after" == "$creation_count_before" ]]
+  jq -e '.deployment_status == "complete"' \
+    "$workspace/infrastructure/state/deployment.json" >/dev/null
+done
+
+for policy_fail_point in queue-policy after-managed-policy after-s3-inline-policy; do
+  workspace="$(new_workspace "adopt-$policy_fail_point")"
+  initialize_mock_state "$workspace/mock-aws-state.json"
+  : >"$workspace/mock-aws.log"
+  assert_failure "$workspace/interrupted.out" \
+    run_deploy "$workspace" MOCK_FAIL_POINT="$policy_fail_point"
+  run_deploy "$workspace" >"$workspace/recovery.out"
+  jq -e '
+    .deployment_status == "complete" and
+    .steps.queue_policy_applied and
+    .steps.role_policies_applied
+  ' "$workspace/infrastructure/state/deployment.json" >/dev/null
+done
+printf '   PASS\n'
+
+printf '9. Adoption rejects ownership and important-configuration drift...\n'
+workspace="$(new_workspace adopt-foreign-bucket)"
+initialize_mock_state "$workspace/mock-aws-state.json"
+: >"$workspace/mock-aws.log"
+assert_failure "$workspace/interrupted.out" \
+  run_deploy "$workspace" MOCK_FAIL_POINT=bucket
+jq '(.bucket.tags[] | select(.Key == "Project")).Value = "foreign"' \
+  "$workspace/mock-aws-state.json" >"$workspace/mock-aws-state.tmp"
+mv "$workspace/mock-aws-state.tmp" "$workspace/mock-aws-state.json"
+assert_failure "$workspace/rejected.out" run_deploy "$workspace"
+grep -Fq 'ownership tags do not match' "$workspace/rejected.out"
+
+workspace="$(new_workspace adopt-queue-drift)"
+initialize_mock_state "$workspace/mock-aws-state.json"
+: >"$workspace/mock-aws.log"
+assert_failure "$workspace/interrupted.out" \
+  run_deploy "$workspace" MOCK_FAIL_POINT=queue
+jq '.queue.visibility_timeout = "999"' \
+  "$workspace/mock-aws-state.json" >"$workspace/mock-aws-state.tmp"
+mv "$workspace/mock-aws-state.tmp" "$workspace/mock-aws-state.json"
+assert_failure "$workspace/rejected.out" run_deploy "$workspace"
+grep -Fq 'visibility timeout' "$workspace/rejected.out"
+
+workspace="$(new_workspace adopt-lambda-drift)"
+initialize_mock_state "$workspace/mock-aws-state.json"
+: >"$workspace/mock-aws.log"
+assert_failure "$workspace/interrupted.out" \
+  run_deploy "$workspace" MOCK_FAIL_POINT=lambda
+jq '.lambda.function.Configuration.Handler = "foreign.handler"' \
+  "$workspace/mock-aws-state.json" >"$workspace/mock-aws-state.tmp"
+mv "$workspace/mock-aws-state.tmp" "$workspace/mock-aws-state.json"
+assert_failure "$workspace/rejected.out" run_deploy "$workspace"
+grep -Fq 'code or configuration differs' "$workspace/rejected.out"
+
+workspace="$(new_workspace adopt-mapping-drift)"
+initialize_mock_state "$workspace/mock-aws-state.json"
+: >"$workspace/mock-aws.log"
+assert_failure "$workspace/interrupted.out" \
+  run_deploy "$workspace" MOCK_FAIL_POINT=mapping
+jq '.mapping.configuration.BatchSize = 2' \
+  "$workspace/mock-aws-state.json" >"$workspace/mock-aws-state.tmp"
+mv "$workspace/mock-aws-state.tmp" "$workspace/mock-aws-state.json"
+assert_failure "$workspace/rejected.out" run_deploy "$workspace"
+grep -Fq 'configuration differs' "$workspace/rejected.out"
+
+workspace="$(new_workspace adopt-account-drift)"
+initialize_mock_state "$workspace/mock-aws-state.json"
+: >"$workspace/mock-aws.log"
+assert_failure "$workspace/interrupted.out" \
+  run_deploy "$workspace" MOCK_FAIL_POINT=bucket
+different_account_id="$(printf '%012d' 654321)"
+assert_failure "$workspace/rejected.out" \
+  run_deploy "$workspace" MOCK_AWS_ACCOUNT_ID="$different_account_id"
+grep -Fq 'Deployment state does not match the authenticated account' \
+  "$workspace/rejected.out"
+
+workspace="$(new_workspace adopt-region-drift)"
+initialize_mock_state "$workspace/mock-aws-state.json"
+: >"$workspace/mock-aws.log"
+assert_failure "$workspace/interrupted.out" \
+  run_deploy "$workspace" MOCK_FAIL_POINT=queue
+queue_account_id="$(printf '%012d' 123456)"
+cross_region_queue_arn="arn:aws:sqs:eu-west-1:$queue_account_id:cloud-file-compression-cli-test-queue"
+assert_failure "$workspace/rejected.out" \
+  run_deploy "$workspace" MOCK_QUEUE_ARN="$cross_region_queue_arn"
+grep -Fq 'queue ARN does not match' "$workspace/rejected.out"
+printf '   PASS\n'
+
+printf '10. Destruction checkpoints exact already-absent resources...\n'
+for absent_resource in mapping lambda role queue bucket; do
+  workspace="$(new_workspace "destroy-absent-$absent_resource")"
+  initialize_mock_state "$workspace/mock-aws-state.json"
+  : >"$workspace/mock-aws.log"
+  run_deploy "$workspace" >/dev/null
+  jq \
+    --arg resource "$absent_resource" \
+    '
+      .[$resource].exists = false |
+      if $resource == "role" then
+        .role.logging_policy = false |
+        .role.s3_policy = false |
+        .role.sqs_policy = false
+      else . end
+    ' \
+    "$workspace/mock-aws-state.json" >"$workspace/mock-aws-state.tmp"
+  mv "$workspace/mock-aws-state.tmp" "$workspace/mock-aws-state.json"
+  run_destroy "$workspace" >"$workspace/destroy.out"
+  grep -Fq 'already absent; checkpointing state' "$workspace/destroy.out"
+  assert_fully_destroyed "$workspace"
+done
+printf '   PASS\n'
+
+printf '11. Ambiguous lookup failures remain fatal and preserve state...\n'
+for lookup_resource in bucket queue role lambda mapping; do
+  workspace="$(new_workspace "lookup-error-$lookup_resource")"
+  initialize_mock_state "$workspace/mock-aws-state.json"
+  : >"$workspace/mock-aws.log"
+  run_deploy "$workspace" >/dev/null
+  : >"$workspace/mock-aws.log"
+  assert_failure "$workspace/destroy.out" \
+    run_destroy "$workspace" MOCK_LOOKUP_ERROR="$lookup_resource"
+  grep -Fq 'refusing to infer absence' "$workspace/destroy.out"
+  [[ -f "$workspace/infrastructure/state/deployment.json" ]]
+  ! grep -Eq 'delete-|detach-role|put-bucket-notification' \
+    "$workspace/mock-aws.log"
+done
+printf '   PASS\n'
+
+printf '12. A second destroy cannot infer targets after state removal...\n'
+workspace="$(new_workspace second-destroy)"
+initialize_mock_state "$workspace/mock-aws-state.json"
+: >"$workspace/mock-aws.log"
+run_deploy "$workspace" >/dev/null
+run_destroy "$workspace" >/dev/null
+: >"$workspace/mock-aws.log"
+assert_failure "$workspace/second-destroy.out" run_destroy "$workspace"
+grep -Fq 'Deployment state is missing' "$workspace/second-destroy.out"
+[[ ! -s "$workspace/mock-aws.log" ]]
+printf '   PASS\n'
+
+printf '13. Bash and JSON validation...\n'
 while IFS= read -r script; do
   bash -n "$script"
 done < <(

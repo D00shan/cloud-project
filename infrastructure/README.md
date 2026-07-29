@@ -128,8 +128,16 @@ The first implementation is deliberately conservative:
 - A rerun may continue only when state matches the authenticated account,
   partition, region, profile, project, environment, and every deterministic
   resource name.
-- Existing resources are reused only when state records their creation and
-  their `DeploymentId`, `Project`, and `Environment` ownership tags match.
+- If an AWS create/configuration call succeeded immediately before an
+  interruption, a rerun can adopt the uncheckpointed result. Adoption requires
+  the expected account, partition, region, name/ARN, and exact
+  `DeploymentId`, `Project`, and `Environment` tags. The queue settings, role
+  trust/policies, Lambda code hash and configuration, event-source mapping
+  endpoints/batch settings, and S3 notification/filter must also exactly match
+  where applicable. A name match alone is never sufficient.
+- Each successful adoption is checkpointed atomically before deployment
+  continues, so later deployment and teardown treat it exactly like a resource
+  recorded during its original create call.
 - Recorded configuration steps may be reapplied to those proven-owned
   resources. This is interruption recovery, not general reconciliation.
 - The initial deployment records a normalized configuration fingerprint and
@@ -143,11 +151,10 @@ The first implementation is deliberately conservative:
   original configuration and deploy it again. The script never silently leaves
   AWS running a mixture of old and new configuration.
 
-If deployment stops, keep `state/deployment.json`. Inspect the reported
-resource, correct the underlying issue, and rerun the same command with the same
-configuration. If a resource was created but could not be tagged and recorded,
-the script refuses to adopt it; inspect and resolve that collision manually
-instead of deleting anything automatically.
+If deployment stops, keep `state/deployment.json` and rerun with the same
+configuration. Exactly matching tagged resources and configurations are
+adopted; missing ownership tags, foreign identities, or configuration
+differences are reported as collisions and are never mutated automatically.
 
 ## Destroy
 
@@ -179,6 +186,12 @@ remain fatal. This makes cleanup safe when deployment stopped between IAM
 operations and its state checkpoint.
 Local state is removed only after every cleanup step succeeds. On partial
 failure, state is preserved and the script prints recovery guidance.
+Before the destruction plan, every recorded resource is looked up
+independently. An exact AWS not-found response is checkpointed atomically as
+already deleted, while `AccessDenied`, expired authentication, networking,
+throttling, malformed output, and other ambiguous failures stop teardown. This
+allows a rerun to continue after deletion succeeded immediately before a crash
+without weakening foreign-resource protection.
 
 Neither deployment nor destruction accepts resource names as command-line
 targets. This prevents arbitrary resources—including the historical stack—from
@@ -194,5 +207,31 @@ Run the isolated AWS CLI simulator suite with:
 
 The suite uses temporary repository copies and a local AWS mock. It exercises a
 fresh deployment, an unchanged rerun, configuration/code drift refusal, IAM
-crash recovery, missing-policy cleanup, fatal authorization errors, ownership
-refusal, shell syntax, and template JSON without using real AWS credentials.
+and resource-creation crash recovery, exact adoption and collision refusal,
+restart-safe already-absent destruction, missing-policy cleanup, fatal lookup
+and authorization errors, ownership refusal, shell syntax, and template JSON
+without using real AWS credentials.
+
+## Duplicate delivery behavior
+
+The compression Lambda is idempotent for SQS duplicate delivery. Every
+compressed object records the source bucket, URL-encoded source key, normalized
+source ETag, and source version ID when supplied by the event as S3 user
+metadata. Before uploading, the handler heads the deterministic compressed key.
+A metadata match proves that the exact source was already processed, so source
+deletion is retried idempotently and the SQS message succeeds. A missing source
+also succeeds only when matching destination metadata proves prior completion.
+Mismatched destination metadata and ambiguous destination lookup failures such
+as `AccessDenied` remain genuine partial-batch failures; existing output is
+never silently overwritten.
+
+The generated Lambda S3 policy grants `s3:GetObject` on the compressed-output
+prefix solely for this destination metadata check. It does not broaden access
+to the bucket.
+
+Manual testing is still required in a disposable AWS account/environment:
+interrupt each create/configuration step after AWS accepts it and verify rerun
+adoption, interrupt each deletion before its state checkpoint and verify
+restart, and redeliver an S3/SQS event after source deletion to verify metadata
+matching against real S3 and Lambda event shapes. Do not use the historical
+stack for these tests.

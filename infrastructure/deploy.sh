@@ -44,7 +44,7 @@ for variable_name in "${required_values[@]}"; do
   require_config_value "$variable_name"
 done
 
-for command_name in aws jq npm zip unzip sha256sum; do
+for command_name in aws jq npm zip unzip sha256sum openssl base64; do
   require_command "$command_name"
 done
 
@@ -114,6 +114,21 @@ state_update() {
   local jq_filter="$1"
   shift
   update_json_file_atomically "$STATE_FILE" "$jq_filter" "$@"
+}
+
+validate_event_source_mapping_json() {
+  local mapping_json="$1"
+
+  jq -e \
+    --arg queue_arn "$QUEUE_ARN" \
+    --arg function_arn "$LAMBDA_FUNCTION_ARN" \
+    '
+      .EventSourceArn == $queue_arn and
+      (.FunctionArn == $function_arn or
+       .FunctionArn == ($function_arn + ":$LATEST")) and
+      .BatchSize == 1 and
+      .FunctionResponseTypes == ["ReportBatchItemFailures"]
+    ' <<<"$mapping_json" >/dev/null
 }
 
 verify_tag_array() {
@@ -278,6 +293,9 @@ fi
 
 log "Checking deterministic resource names for collisions..."
 
+adopt_bucket=false
+adopt_queue=false
+adopt_role=false
 bucket_exists=false
 if s3_bucket_status; then
   bucket_exists=true
@@ -343,9 +361,6 @@ else
   DEPLOYMENT_TAG_ID="$DEPLOYMENT_ID"
 
   if [[ "$bucket_exists" == true ]]; then
-    [[ "$(state_flag '.resources.bucket.created')" == true ]] \
-      || die "Resource collision: bucket exists but state does not record its creation: $BUCKET_NAME."
-
     bucket_tags="$(
       aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
         s3api get-bucket-tagging --bucket "$BUCKET_NAME" \
@@ -354,18 +369,45 @@ else
 
     verify_tag_array "$bucket_tags" '.TagSet' "$DEPLOYMENT_TAG_ID" \
       || die "Recorded bucket ownership tags do not match deployment state: $BUCKET_NAME"
+
+    bucket_location="$(
+      aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+        s3api get-bucket-location --bucket "$BUCKET_NAME" \
+        --query LocationConstraint --output text --no-cli-pager
+    )"
+    [[ "$bucket_location" == "None" ]] && bucket_location="us-east-1"
+    [[ "$bucket_location" == "$AWS_REGION" ]] \
+      || die "Resource collision: owned bucket region '$bucket_location' does not match '$AWS_REGION'."
+
+    if [[ "$(state_flag '.resources.bucket.created')" != true ]]; then
+      adopt_bucket=true
+    fi
   elif [[ "$(state_flag '.resources.bucket.created')" == true ]]; then
     die "State records bucket creation, but the bucket no longer exists: $BUCKET_NAME"
   fi
 
   if [[ "$queue_exists" == true ]]; then
-    [[ "$(state_flag '.resources.queue.created')" == true ]] \
-      || die "Resource collision: queue exists but state does not record its creation: $SQS_QUEUE_NAME."
-
     recorded_queue_url="$(jq -r '.resources.queue.url // empty' "$STATE_FILE")"
     actual_queue_url="$(jq -r '.QueueUrl // empty' <<<"$queue_json")"
-    [[ "$actual_queue_url" == "$recorded_queue_url" ]] \
+    [[ -n "$actual_queue_url" ]] \
+      || die "Resource collision: existing SQS queue lookup returned no URL."
+    [[ -z "$recorded_queue_url" || "$actual_queue_url" == "$recorded_queue_url" ]] \
       || die "Recorded SQS queue URL does not match the existing queue."
+
+    queue_attributes_json="$(
+      aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+        sqs get-queue-attributes --queue-url "$actual_queue_url" \
+        --attribute-names QueueArn VisibilityTimeout Policy \
+        --output json --no-cli-pager
+    )"
+    actual_queue_arn="$(jq -r '.Attributes.QueueArn // empty' <<<"$queue_attributes_json")"
+    actual_visibility_timeout="$(
+      jq -r '.Attributes.VisibilityTimeout // empty' <<<"$queue_attributes_json"
+    )"
+    [[ "$actual_queue_arn" == "$QUEUE_ARN" ]] \
+      || die "Resource collision: existing queue ARN does not match $QUEUE_ARN."
+    [[ "$actual_visibility_timeout" == "$SQS_VISIBILITY_TIMEOUT" ]] \
+      || die "Resource collision: existing queue visibility timeout does not match configured value."
 
     queue_tags="$(
       aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
@@ -375,13 +417,27 @@ else
 
     verify_tag_map "$queue_tags" '.Tags' "$DEPLOYMENT_TAG_ID" \
       || die "Recorded queue ownership tags do not match deployment state: $SQS_QUEUE_NAME"
+
+    if [[ "$(state_flag '.resources.queue.created')" != true ]]; then
+      adopt_queue=true
+    fi
   elif [[ "$(state_flag '.resources.queue.created')" == true ]]; then
     die "State records queue creation, but the queue no longer exists: $SQS_QUEUE_NAME"
   fi
 
   if [[ "$role_exists" == true ]]; then
-    [[ "$(state_flag '.resources.role.created')" == true ]] \
-      || die "Resource collision: role exists but state does not record its creation: $LAMBDA_ROLE_NAME."
+    actual_role_arn="$(jq -r '.Role.Arn // empty' <<<"$role_json")"
+    [[ "$actual_role_arn" == "$LAMBDA_ROLE_ARN" ]] \
+      || die "Resource collision: existing IAM role ARN does not match $LAMBDA_ROLE_ARN."
+
+    actual_trust_policy="$(
+      jq -cS '.Role.AssumeRolePolicyDocument // empty' <<<"$role_json"
+    )"
+    expected_trust_policy="$(
+      jq -cS . "$SCRIPT_DIR/config/templates/lambda-trust-policy.json"
+    )"
+    [[ "$actual_trust_policy" == "$expected_trust_policy" ]] \
+      || die "Resource collision: existing IAM role trust policy does not match."
 
     role_tags="$(
       aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
@@ -391,13 +447,20 @@ else
 
     verify_tag_array "$role_tags" '.Tags' "$DEPLOYMENT_TAG_ID" \
       || die "Recorded role ownership tags do not match deployment state: $LAMBDA_ROLE_NAME"
+
+    if [[ "$(state_flag '.resources.role.created')" != true ]]; then
+      adopt_role=true
+    fi
   elif [[ "$(state_flag '.resources.role.created')" == true ]]; then
     die "State records role creation, but the role no longer exists: $LAMBDA_ROLE_NAME"
   fi
 
   if [[ "$lambda_exists" == true ]]; then
-    [[ "$(state_flag '.resources.lambda.created')" == true ]] \
-      || die "Resource collision: function exists but state does not record its creation: $LAMBDA_FUNCTION_NAME."
+    actual_lambda_arn="$(
+      jq -r '.Configuration.FunctionArn // empty' <<<"$lambda_json"
+    )"
+    [[ "$actual_lambda_arn" == "$LAMBDA_FUNCTION_ARN" ]] \
+      || die "Resource collision: existing Lambda ARN does not match $LAMBDA_FUNCTION_ARN."
 
     function_tags="$(
       aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
@@ -478,6 +541,9 @@ CONFIGURATION_FINGERPRINT="$(
   sha256sum <<<"$normalized_deployment_configuration" | awk '{print $1}'
 )"
 LAMBDA_PACKAGE_SHA256="$(sha256sum "$ZIP_FILE" | awk '{print $1}')"
+LAMBDA_PACKAGE_CODE_SHA256="$(
+  openssl dgst -sha256 -binary "$ZIP_FILE" | base64 | tr -d '\n'
+)"
 
 if [[ "$RESUMING" == true ]]; then
   recorded_configuration_fingerprint="$(
@@ -500,6 +566,217 @@ if [[ "$RESUMING" == true ]]; then
     || die "Lambda package content changed since this stack was created. Refusing to leave mixed code/configuration. Destroy the temporary stack with ./infrastructure/destroy.sh, then deploy it again."
 
   log "Rerun fingerprints match recorded deployment configuration and Lambda package."
+
+fi
+
+if [[ "$RESUMING" == true ]]; then
+  # Validate every mutable integration that may have succeeded immediately
+  # before a crash. Exact matches can be checkpointed; mismatches are
+  # collisions and must fail before any AWS mutation.
+  if [[ "$queue_exists" == true ]]; then
+    actual_queue_policy="$(
+      jq -r '.Attributes.Policy // empty' <<<"$queue_attributes_json"
+    )"
+
+    if [[ -n "$actual_queue_policy" ]]; then
+      actual_queue_policy_canonical="$(jq -cS . <<<"$actual_queue_policy")"
+      expected_queue_policy_canonical="$(
+        jq -cS . "$GENERATED_DIR/sqs-resource-policy.json"
+      )"
+      [[ "$actual_queue_policy_canonical" == "$expected_queue_policy_canonical" ]] \
+        || die "Resource collision: existing SQS queue policy differs from the rendered deployment policy."
+      state_update '.steps.queue_policy_applied = true'
+    fi
+    if [[ "$adopt_queue" == true ]]; then
+      state_update \
+        '.resources.queue.created = true | .resources.queue.url = $queue_url' \
+        --arg queue_url "$actual_queue_url"
+      log "Adopted exactly matching tagged SQS queue into deployment state."
+    fi
+  fi
+
+  if [[ "$role_exists" == true ]]; then
+    attached_policies="$(
+      aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+        iam list-attached-role-policies --role-name "$LAMBDA_ROLE_NAME" \
+        --output json --no-cli-pager
+    )"
+    unexpected_managed_policy_count="$(
+      jq \
+        --arg expected "$LOGGING_POLICY_ARN" \
+        '[.AttachedPolicies[]? | select(.PolicyArn != $expected)] | length' \
+        <<<"$attached_policies"
+    )"
+    [[ "$unexpected_managed_policy_count" == "0" ]] \
+      || die "Resource collision: owned IAM role has an unexpected managed policy attachment."
+
+    inline_policy_names="$(
+      aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+        iam list-role-policies --role-name "$LAMBDA_ROLE_NAME" \
+        --output json --no-cli-pager
+    )"
+    unexpected_inline_policy_count="$(
+      jq \
+        --arg s3_name "$LAMBDA_S3_POLICY_NAME" \
+        --arg sqs_name "$LAMBDA_SQS_POLICY_NAME" \
+        '[.PolicyNames[]? | select(. != $s3_name and . != $sqs_name)] | length' \
+        <<<"$inline_policy_names"
+    )"
+    [[ "$unexpected_inline_policy_count" == "0" ]] \
+      || die "Resource collision: owned IAM role has an unexpected inline policy."
+
+    for policy_name_and_file in \
+      "$LAMBDA_S3_POLICY_NAME:$GENERATED_DIR/lambda-s3-policy.json" \
+      "$LAMBDA_SQS_POLICY_NAME:$GENERATED_DIR/lambda-sqs-policy.json"; do
+
+      policy_name="${policy_name_and_file%%:*}"
+      policy_file="${policy_name_and_file#*:}"
+
+      if jq -e --arg name "$policy_name" \
+        '.PolicyNames | index($name) != null' \
+        <<<"$inline_policy_names" >/dev/null; then
+
+        existing_policy="$(
+          aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+            iam get-role-policy \
+            --role-name "$LAMBDA_ROLE_NAME" \
+            --policy-name "$policy_name" \
+            --output json --no-cli-pager
+        )"
+        existing_policy_canonical="$(
+          jq -cS '.PolicyDocument' <<<"$existing_policy"
+        )"
+        expected_policy_canonical="$(jq -cS . "$policy_file")"
+        [[ "$existing_policy_canonical" == "$expected_policy_canonical" ]] \
+          || die "Resource collision: inline IAM policy '$policy_name' differs from the rendered policy."
+      fi
+    done
+    if [[ "$adopt_role" == true ]]; then
+      state_update '.resources.role.created = true'
+      log "Adopted exactly matching tagged IAM role into deployment state."
+    fi
+  fi
+
+  if [[ "$lambda_exists" == true ]]; then
+    expected_lambda_environment="$(
+      jq -ncS \
+        --arg incoming "$INCOMING_PREFIX" \
+        --arg compressed "$COMPRESSED_PREFIX" \
+        '{COMPRESSED_PREFIX:$compressed,INCOMING_PREFIX:$incoming}'
+    )"
+    actual_lambda_environment="$(
+      jq -cS '.Configuration.Environment.Variables // {}' <<<"$lambda_json"
+    )"
+
+    jq -e \
+      --arg arn "$LAMBDA_FUNCTION_ARN" \
+      --arg runtime "$LAMBDA_RUNTIME" \
+      --arg handler "$LAMBDA_HANDLER" \
+      --arg role "$LAMBDA_ROLE_ARN" \
+      --arg architecture "$LAMBDA_ARCHITECTURE" \
+      --arg code_sha256 "$LAMBDA_PACKAGE_CODE_SHA256" \
+      --argjson timeout "$LAMBDA_TIMEOUT" \
+      --argjson memory "$LAMBDA_MEMORY_SIZE" \
+      '
+        .Configuration.FunctionArn == $arn and
+        .Configuration.Runtime == $runtime and
+        .Configuration.Handler == $handler and
+        .Configuration.Role == $role and
+        .Configuration.Timeout == $timeout and
+        .Configuration.MemorySize == $memory and
+        .Configuration.Architectures == [$architecture] and
+        .Configuration.CodeSha256 == $code_sha256
+      ' <<<"$lambda_json" >/dev/null \
+      || die "Resource collision: existing Lambda code or configuration differs from the recorded deployment."
+
+    [[ "$actual_lambda_environment" == "$expected_lambda_environment" ]] \
+      || die "Resource collision: existing Lambda environment differs from configured prefixes."
+
+    if [[ "$(state_flag '.resources.lambda.created')" != true ]]; then
+      state_update '.resources.lambda.created = true'
+      log "Adopted exactly matching tagged Lambda function into deployment state."
+    fi
+  fi
+
+  if [[ "$queue_exists" == true && "$lambda_exists" == true ]]; then
+    recorded_mapping_uuid="$(
+      jq -r '.resources.event_source_mapping_uuid // empty' "$STATE_FILE"
+    )"
+
+    if [[ -n "$recorded_mapping_uuid" ]]; then
+      recorded_mapping_json="$(
+        aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+          lambda get-event-source-mapping \
+          --uuid "$recorded_mapping_uuid" \
+          --output json --no-cli-pager
+      )"
+      validate_event_source_mapping_json "$recorded_mapping_json" \
+        || die "Resource collision: recorded event-source mapping configuration differs."
+    else
+      existing_mappings="$(
+        aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+          lambda list-event-source-mappings \
+          --event-source-arn "$QUEUE_ARN" \
+          --function-name "$LAMBDA_FUNCTION_NAME" \
+          --output json --no-cli-pager
+      )"
+      mapping_count="$(jq '.EventSourceMappings | length' <<<"$existing_mappings")"
+
+      if (( mapping_count == 1 )); then
+        matching_mapping="$(jq -c '.EventSourceMappings[0]' <<<"$existing_mappings")"
+        validate_event_source_mapping_json "$matching_mapping" \
+          || die "Resource collision: unrecorded event-source mapping configuration differs."
+        adopted_mapping_uuid="$(jq -r '.UUID // empty' <<<"$matching_mapping")"
+        [[ -n "$adopted_mapping_uuid" ]] \
+          || die "Existing event-source mapping returned no UUID."
+        state_update \
+          '.resources.event_source_mapping_uuid = $uuid |
+           .steps.event_source_mapping_enabled = true' \
+          --arg uuid "$adopted_mapping_uuid"
+        log "Adopted exactly matching SQS-to-Lambda mapping into deployment state."
+      elif (( mapping_count > 1 )); then
+        die "Resource collision: multiple unrecorded event-source mappings target the queue and function."
+      fi
+    fi
+  fi
+
+  if [[ "$bucket_exists" == true ]]; then
+    existing_notification="$(
+      aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+        s3api get-bucket-notification-configuration \
+        --bucket "$BUCKET_NAME" \
+        --output json --no-cli-pager
+    )"
+    existing_notification_count="$(
+      jq '
+        ([.QueueConfigurations[]?] | length) +
+        ([.LambdaFunctionConfigurations[]?] | length) +
+        ([.TopicConfigurations[]?] | length)
+      ' <<<"$existing_notification"
+    )"
+
+    if (( existing_notification_count > 0 )); then
+      jq -e '
+        ([.LambdaFunctionConfigurations[]?] | length) == 0 and
+        ([.TopicConfigurations[]?] | length) == 0
+      ' <<<"$existing_notification" >/dev/null \
+        || die "Resource collision: existing S3 notification configuration contains an unexpected Lambda or topic destination."
+      actual_notification_canonical="$(
+        jq -cS '{QueueConfigurations:(.QueueConfigurations // [])}' \
+          <<<"$existing_notification"
+      )"
+      expected_notification_canonical="$(
+        jq -cS . "$GENERATED_DIR/s3-notification.json"
+      )"
+      [[ "$actual_notification_canonical" == "$expected_notification_canonical" ]] \
+        || die "Resource collision: existing S3 notification configuration differs from the rendered configuration."
+      state_update '.steps.s3_notification_applied = true'
+    fi
+    if [[ "$adopt_bucket" == true ]]; then
+      state_update '.resources.bucket.created = true'
+      log "Adopted exactly matching tagged S3 bucket into deployment state."
+    fi
+  fi
 fi
 
 if [[ ! -f "$STATE_FILE" ]]; then
@@ -921,15 +1198,17 @@ done
 
 state_update '.steps.event_source_mapping_enabled = true'
 
-log "Applying S3 notification after the queue policy is active..."
-sleep 5
+if [[ "$(state_flag '.steps.s3_notification_applied')" != true ]]; then
+  log "Applying S3 notification after the queue policy is active..."
+  sleep 5
 
-aws \
-  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-  s3api put-bucket-notification-configuration \
-  --bucket "$BUCKET_NAME" \
-  --notification-configuration "file://$GENERATED_DIR/s3-notification.json" \
-  --no-cli-pager
+  aws \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+    s3api put-bucket-notification-configuration \
+    --bucket "$BUCKET_NAME" \
+    --notification-configuration "file://$GENERATED_DIR/s3-notification.json" \
+    --no-cli-pager
+fi
 
 state_update \
   '.steps.s3_notification_applied = true |
