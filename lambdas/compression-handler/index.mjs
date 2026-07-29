@@ -63,9 +63,14 @@ function metadataMatches(actualMetadata, expectedMetadata) {
     ])
   );
 
-  return Object.entries(expectedMetadata).every(
-    ([key, value]) => normalizedActual[key] === value
+  const actualEntries = Object.entries(normalizedActual).sort(([a], [b]) =>
+    a.localeCompare(b)
   );
+  const expectedEntries = Object.entries(expectedMetadata).sort(([a], [b]) =>
+    a.localeCompare(b)
+  );
+
+  return JSON.stringify(actualEntries) === JSON.stringify(expectedEntries);
 }
 
 async function compressObject(s3Record, { s3Client, UploadClass }) {
@@ -141,35 +146,35 @@ async function compressObject(s3Record, { s3Client, UploadClass }) {
   }
 
   async function deleteSourceObject() {
-  try {
-    return await s3Client.send(
-      new DeleteObjectCommand({
-        Bucket: bucketName,
-        Key: key,
-        IfMatch: formatETagCondition(eventETag),
-      })
-    );
-  } catch (error) {
-    if (isNotFoundError(error)) {
-      return { alreadyAbsent: true };
-    }
-
-    if (isPreconditionFailedError(error)) {
-      console.warn(
-        "Source object changed before deletion; leaving replacement untouched",
-        {
-          bucketName,
-          key,
-          expectedETag: eventETag,
-        }
+    try {
+      return await s3Client.send(
+        new DeleteObjectCommand({
+          Bucket: bucketName,
+          Key: key,
+          IfMatch: formatETagCondition(eventETag),
+        })
       );
+    } catch (error) {
+      if (isNotFoundError(error)) {
+        return { alreadyAbsent: true };
+      }
 
-      return { sourceChanged: true };
+      if (isPreconditionFailedError(error)) {
+        console.warn(
+          "Source object changed before deletion; leaving replacement untouched",
+          {
+            bucketName,
+            key,
+            expectedETag: eventETag,
+          }
+        );
+
+        return { sourceChanged: true };
+      }
+
+      throw error;
     }
-
-    throw error;
   }
-}
 
   const existingDestination = await headCompressedObject();
 

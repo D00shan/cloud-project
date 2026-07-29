@@ -27,7 +27,9 @@ names.
 Files in `config/templates/` are portable source documents:
 
 - `lambda-trust-policy.json` allows the Lambda service to assume the execution role.
-- `lambda-s3-policy.json.template` limits the function to reading and deleting incoming objects and writing compressed objects.
+- `lambda-s3-policy.json.template` limits the function to reading and deleting
+  incoming objects, reading/writing compressed objects, and listing only the
+  compressed prefix.
 - `lambda-sqs-policy.json.template` limits the function to consuming messages from the configured queue.
 - `sqs-resource-policy.json.template` allows only the configured S3 bucket and account to send messages to the configured queue.
 - `s3-notification.json.template` sends object-created events under the configured incoming prefix to that queue.
@@ -77,6 +79,12 @@ edit the AWS_PROFILE and AWS_REGION if necessary and run:
 ./infrastructure/preflight.sh
 ```
 
+Preflight also verifies that the installed AWS CLI v2 model supports S3 bucket
+tags inside `CreateBucketConfiguration`. Deployment deliberately has no
+create-then-tag fallback: ownership tags must be part of `CreateBucket` so an
+interruption cannot leave an untagged bucket that looks adoptable. Upgrade AWS
+CLI v2 if this capability check fails.
+
 The original manually created AWS environment is documented separately under
 `docs/current-aws-state/`.
 
@@ -109,6 +117,11 @@ the private S3 bucket, SQS queue, Lambda execution role, Lambda function, event
 source mapping, and S3 notification in dependency order. It attaches the
 AWS-managed `AWSLambdaBasicExecutionRole` policy and adds the two rendered
 least-privilege application policies as inline role policies.
+
+Bucket creation sends `DeploymentId`, `Project`, and `Environment` tags in the
+same `CreateBucket` request as `BucketOwnerEnforced` ownership and the regional
+location constraint. Deployment waits for the bucket and verifies those tags
+before atomically recording bucket creation in local state.
 
 Generated JSON is stored under `build/generated-config/`, the Lambda ZIP under
 `build/lambda-package/`, and deployment ownership state under
@@ -150,6 +163,13 @@ The first implementation is deliberately conservative:
 - When a fingerprint differs, destroy the parallel temporary stack using its
   original configuration and deploy it again. The script never silently leaves
   AWS running a mixture of old and new configuration.
+- An existing event-source mapping is adopted only when its queue/function,
+  batch size, zero batching window, partial-batch response setting, filters,
+  scaling, destination, and source-specific configuration match. `Enabled`,
+  `Creating`, `Enabling`, and `Updating` are the only acceptable states.
+  Adoption records the UUID while leaving the enabled checkpoint false. The
+  checkpoint becomes true only after a later AWS lookup reports `Enabled`;
+  disabled, failed, deleting, unknown, or timed-out mappings fail closed.
 
 If deployment stops, keep `state/deployment.json` and rerun with the same
 configuration. Exactly matching tagged resources and configurations are
@@ -226,12 +246,38 @@ as `AccessDenied` remain genuine partial-batch failures; existing output is
 never silently overwritten.
 
 The generated Lambda S3 policy grants `s3:GetObject` on the compressed-output
-prefix solely for this destination metadata check. It does not broaden access
-to the bucket.
+prefix solely for this destination metadata check. It also grants
+`s3:ListBucket` on the bucket ARN with an `s3:prefix` condition restricted to
+the compressed prefix. S3 can otherwise return `403 AccessDenied` for a missing
+`HeadObject`, making it impossible to distinguish a new destination from a real
+authorization failure. No unrelated prefix can be listed.
+
+Source ETags are opaque and case-sensitive. Both source download and deletion
+use the event ETag as an `IfMatch` condition. If a newer object reuses the same
+key before download, S3 returns `412 PreconditionFailed`; the stale event
+succeeds without reading, compressing, or deleting the replacement. If the key
+changes after download, the compressed result may finish, but conditional
+deletion returns `412` and the replacement remains untouched. `AccessDenied`
+and unexpected errors remain genuine SQS partial-batch failures.
+
+## Local test suite
+
+Run every Phase 3 simulator and Lambda regression test from the repository
+root:
+
+```bash
+./test.sh
+```
+
+The command does not use AWS credentials or contact AWS. It creates isolated
+temporary workspaces, uses the local AWS CLI fixture, packages the Lambda in an
+ignored build directory, and fails on the first unsuccessful suite.
 
 Manual testing is still required in a disposable AWS account/environment:
 interrupt each create/configuration step after AWS accepts it and verify rerun
 adoption, interrupt each deletion before its state checkpoint and verify
 restart, and redeliver an S3/SQS event after source deletion to verify metadata
-matching against real S3 and Lambda event shapes. Do not use the historical
-stack for these tests.
+matching and conditional `GetObject`/`DeleteObject` behavior against real S3
+and Lambda event shapes. Also verify the installed AWS CLI accepts atomic S3
+creation tags and observe `Creating` to `Enabled` event-source mapping
+transitions. Do not use the historical stack for these tests.

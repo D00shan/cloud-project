@@ -128,7 +128,19 @@ validate_event_source_mapping_json() {
        .FunctionArn == ($function_arn + ":$LATEST")) and
       .BatchSize == 1 and
       (.MaximumBatchingWindowInSeconds // 0) == 0 and
-      .FunctionResponseTypes == ["ReportBatchItemFailures"]
+      .FunctionResponseTypes == ["ReportBatchItemFailures"] and
+      ((.FilterCriteria.Filters // []) | length) == 0 and
+      (.ScalingConfig // {}) == {} and
+      (.DestinationConfig // {}) == {} and
+      ((.SourceAccessConfigurations // []) | length) == 0 and
+      (.KMSKeyArn // "") == "" and
+      (.MetricsConfig // {}) == {} and
+      (.ProvisionedPollerConfig // {}) == {} and
+      (.AmazonManagedKafkaEventSourceConfig // {}) == {} and
+      (.SelfManagedKafkaEventSourceConfig // {}) == {} and
+      (.DocumentDBEventSourceConfig // {}) == {} and
+      (.SelfManagedEventSource // {}) == {} and
+      (.RabbitMQEventSourceConfig // {}) == {}
     ' <<<"$mapping_json" >/dev/null
 }
 
@@ -752,32 +764,18 @@ if [[ "$RESUMING" == true ]]; then
         matching_mapping="$(jq -c '.EventSourceMappings[0]' <<<"$existing_mappings")"
         validate_event_source_mapping_json "$matching_mapping" \
           || die "Resource collision: unrecorded event-source mapping configuration differs."
+        adopted_mapping_state="$(jq -r '.State // empty' <<<"$matching_mapping")"
+        if ! validate_event_source_mapping_state "$adopted_mapping_state"; then
+          die "Resource collision: unrecorded event-source mapping is in incompatible state '$adopted_mapping_state'."
+        fi
+
         adopted_mapping_uuid="$(jq -r '.UUID // empty' <<<"$matching_mapping")"
         [[ -n "$adopted_mapping_uuid" ]] \
           || die "Existing event-source mapping returned no UUID."
+
         state_update \
-          'validate_event_source_mapping_json "$matching_mapping" \
-  || die "Resource collision: unrecorded event-source mapping configuration differs."
-
-adopted_mapping_state="$(
-  jq -r '.State // empty' <<<"$matching_mapping"
-)"
-
-if ! validate_event_source_mapping_state "$adopted_mapping_state"; then
-  die "Resource collision: unrecorded event-source mapping is in incompatible state '$adopted_mapping_state'."
-fi
-
-adopted_mapping_uuid="$(jq -r '.UUID // empty' <<<"$matching_mapping")"
-
-[[ -n "$adopted_mapping_uuid" ]] \
-  || die "Existing event-source mapping returned no UUID."
-
-state_update \
-  '.resources.event_source_mapping_uuid = $uuid |
-   .steps.event_source_mapping_enabled = false' \
-  --arg uuid "$adopted_mapping_uuid"
-
-log "Adopted exactly matching SQS-to-Lambda mapping into deployment state."' \
+          '.resources.event_source_mapping_uuid = $uuid |
+           .steps.event_source_mapping_enabled = false' \
           --arg uuid "$adopted_mapping_uuid"
         log "Adopted exactly matching SQS-to-Lambda mapping into deployment state."
       elif (( mapping_count > 1 )); then
@@ -1213,6 +1211,7 @@ if [[ -z "$EVENT_SOURCE_MAPPING_UUID" ]]; then
       --event-source-arn "$QUEUE_ARN" \
       --function-name "$LAMBDA_FUNCTION_NAME" \
       --batch-size 1 \
+      --maximum-batching-window-in-seconds 0 \
       --function-response-types ReportBatchItemFailures \
       --enabled \
       --output json --no-cli-pager
@@ -1223,7 +1222,8 @@ if [[ -z "$EVENT_SOURCE_MAPPING_UUID" ]]; then
     || die "Lambda did not return an event-source mapping UUID."
 
   state_update \
-    '.resources.event_source_mapping_uuid = $uuid' \
+    '.resources.event_source_mapping_uuid = $uuid |
+     .steps.event_source_mapping_enabled = false' \
     --arg uuid "$EVENT_SOURCE_MAPPING_UUID"
 fi
 

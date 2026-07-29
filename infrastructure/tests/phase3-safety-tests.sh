@@ -59,7 +59,13 @@ initialize_mock_state() {
   local state_file="$1"
 
   jq -n '{
-    bucket:{exists:false,tags:[],notification:{}},
+    bucket:{
+      exists:false,
+      tags:[],
+      notification:{},
+      location:"",
+      object_ownership:""
+    },
     queue:{
       exists:false,
       name:"cloud-file-compression-cli-test-queue",
@@ -82,7 +88,12 @@ initialize_mock_state() {
       tags:{},
       function:{}
     },
-    mapping:{exists:false,enabled:false,configuration:{}}
+    mapping:{
+      exists:false,
+      state:"Deleted",
+      state_queries_remaining:0,
+      configuration:{}
+    }
   }' >"$state_file"
 }
 
@@ -154,6 +165,18 @@ jq -e '
   (.deployment_configuration_fingerprint | length == 64) and
   (.lambda_package_sha256 | length == 64)
 ' "$workspace/infrastructure/state/deployment.json" >/dev/null
+jq -e '
+  (.Statement | length) == 3 and
+  any(.Statement[];
+    .Resource == "arn:aws:s3:::cloud-file-compression-cli-test-000000123456-us-east-1/compressed/*" and
+    (.Action | sort) == (["s3:AbortMultipartUpload","s3:GetObject","s3:PutObject"] | sort)
+  ) and
+  any(.Statement[];
+    .Action == "s3:ListBucket" and
+    .Resource == "arn:aws:s3:::cloud-file-compression-cli-test-000000123456-us-east-1" and
+    .Condition.StringLike["s3:prefix"] == ["compressed/*"]
+  )
+' "$workspace/infrastructure/build/generated-config/lambda-s3-policy.json" >/dev/null
 first_package_hash="$(
   jq -r '.lambda_package_sha256' \
     "$workspace/infrastructure/state/deployment.json"
@@ -285,6 +308,23 @@ for recovery_case in \
   : >"$workspace/mock-aws.log"
   assert_failure "$workspace/interrupted.out" \
     run_deploy "$workspace" MOCK_FAIL_POINT="$fail_point"
+  if [[ "$fail_point" == "bucket" ]]; then
+    interrupted_deployment_id="$(
+      jq -r '.deployment_id' \
+        "$workspace/infrastructure/state/deployment.json"
+    )"
+    jq -e \
+      --arg deployment_id "$interrupted_deployment_id" \
+      '
+        .bucket.exists and
+        .bucket.object_ownership == "BucketOwnerEnforced" and
+        any(.bucket.tags[]; .Key == "DeploymentId" and .Value == $deployment_id) and
+        any(.bucket.tags[]; .Key == "Project" and .Value == "cloud-file-compression") and
+        any(.bucket.tags[]; .Key == "Environment" and .Value == "cli-test")
+      ' "$workspace/mock-aws-state.json" >/dev/null
+    jq -e '.resources.bucket.created == false' \
+      "$workspace/infrastructure/state/deployment.json" >/dev/null
+  fi
   creation_count_before="$(
     grep -c "$creation_operation" "$workspace/mock-aws.log" || true
   )"
@@ -323,6 +363,31 @@ jq '(.bucket.tags[] | select(.Key == "Project")).Value = "foreign"' \
 mv "$workspace/mock-aws-state.tmp" "$workspace/mock-aws-state.json"
 assert_failure "$workspace/rejected.out" run_deploy "$workspace"
 grep -Fq 'ownership tags do not match' "$workspace/rejected.out"
+
+for bucket_tag_case in missing-deployment-id mismatched-project mismatched-environment; do
+  workspace="$(new_workspace "adopt-bucket-$bucket_tag_case")"
+  initialize_mock_state "$workspace/mock-aws-state.json"
+  : >"$workspace/mock-aws.log"
+  assert_failure "$workspace/interrupted.out" \
+    run_deploy "$workspace" MOCK_FAIL_POINT=bucket
+  case "$bucket_tag_case" in
+    missing-deployment-id)
+      tag_filter='.bucket.tags |= map(select(.Key != "DeploymentId"))'
+      ;;
+    mismatched-project)
+      tag_filter='(.bucket.tags[] | select(.Key == "Project")).Value = "foreign"'
+      ;;
+    mismatched-environment)
+      tag_filter='(.bucket.tags[] | select(.Key == "Environment")).Value = "foreign"'
+      ;;
+  esac
+  jq "$tag_filter" "$workspace/mock-aws-state.json" \
+    >"$workspace/mock-aws-state.tmp"
+  mv "$workspace/mock-aws-state.tmp" "$workspace/mock-aws-state.json"
+  assert_failure "$workspace/rejected.out" run_deploy "$workspace"
+  grep -Fq 'ownership tags do not match' "$workspace/rejected.out"
+  [[ "$(grep -c 's3api create-bucket' "$workspace/mock-aws.log")" == "1" ]]
+done
 
 workspace="$(new_workspace adopt-queue-drift)"
 initialize_mock_state "$workspace/mock-aws-state.json"
@@ -380,7 +445,74 @@ assert_failure "$workspace/rejected.out" \
 grep -Fq 'queue ARN does not match' "$workspace/rejected.out"
 printf '   PASS\n'
 
-printf '10. Destruction checkpoints exact already-absent resources...\n'
+printf '10. Event-source mapping adoption is configuration- and state-safe...\n'
+for mapping_state in Enabled Disabled Failed; do
+  workspace="$(new_workspace "mapping-${mapping_state,,}")"
+  initialize_mock_state "$workspace/mock-aws-state.json"
+  : >"$workspace/mock-aws.log"
+  assert_failure "$workspace/interrupted.out" \
+    run_deploy "$workspace" \
+      MOCK_FAIL_POINT=mapping \
+      MOCK_MAPPING_INITIAL_STATE="$mapping_state"
+  if [[ "$mapping_state" == "Enabled" ]]; then
+    run_deploy "$workspace" >"$workspace/recovery.out"
+    jq -e '
+      .resources.event_source_mapping_uuid == "phase3-test-mapping" and
+      .steps.event_source_mapping_enabled == true
+    ' "$workspace/infrastructure/state/deployment.json" >/dev/null
+  else
+    assert_failure "$workspace/rejected.out" run_deploy "$workspace"
+    grep -Fq "incompatible state '$mapping_state'" "$workspace/rejected.out"
+    jq -e '.steps.event_source_mapping_enabled == false' \
+      "$workspace/infrastructure/state/deployment.json" >/dev/null
+    [[ "$(grep -c 'lambda create-event-source-mapping' "$workspace/mock-aws.log")" == "1" ]]
+  fi
+done
+
+workspace="$(new_workspace mapping-transitional)"
+initialize_mock_state "$workspace/mock-aws-state.json"
+: >"$workspace/mock-aws.log"
+assert_failure "$workspace/interrupted.out" \
+  run_deploy "$workspace" \
+    MOCK_FAIL_POINT=mapping \
+    MOCK_MAPPING_INITIAL_STATE=Creating \
+    MOCK_MAPPING_TRANSITION_POLLS=1
+run_deploy "$workspace" >"$workspace/recovery.out"
+jq -e '
+  .resources.event_source_mapping_uuid == "phase3-test-mapping" and
+  .steps.event_source_mapping_enabled == true
+' "$workspace/infrastructure/state/deployment.json" >/dev/null
+grep -Fq 'Adopted exactly matching SQS-to-Lambda mapping' \
+  "$workspace/recovery.out"
+
+workspace="$(new_workspace mapping-batching-drift)"
+initialize_mock_state "$workspace/mock-aws-state.json"
+: >"$workspace/mock-aws.log"
+assert_failure "$workspace/interrupted.out" \
+  run_deploy "$workspace" MOCK_FAIL_POINT=mapping
+jq '.mapping.configuration.MaximumBatchingWindowInSeconds = 5' \
+  "$workspace/mock-aws-state.json" >"$workspace/mock-aws-state.tmp"
+mv "$workspace/mock-aws-state.tmp" "$workspace/mock-aws-state.json"
+assert_failure "$workspace/rejected.out" run_deploy "$workspace"
+grep -Fq 'mapping configuration differs' "$workspace/rejected.out"
+jq -e '.steps.event_source_mapping_enabled == false' \
+  "$workspace/infrastructure/state/deployment.json" >/dev/null
+
+workspace="$(new_workspace mapping-timeout)"
+initialize_mock_state "$workspace/mock-aws-state.json"
+: >"$workspace/mock-aws.log"
+assert_failure "$workspace/interrupted.out" \
+  run_deploy "$workspace" MOCK_FAIL_POINT=mapping
+assert_failure "$workspace/timeout.out" \
+  run_deploy "$workspace" MOCK_MAPPING_NEVER_ENABLE=1
+grep -Fq 'Timed out waiting' "$workspace/timeout.out"
+jq -e '
+  .resources.event_source_mapping_uuid == "phase3-test-mapping" and
+  .steps.event_source_mapping_enabled == false
+' "$workspace/infrastructure/state/deployment.json" >/dev/null
+printf '   PASS\n'
+
+printf '11. Destruction checkpoints exact already-absent resources...\n'
 for absent_resource in mapping lambda role queue bucket; do
   workspace="$(new_workspace "destroy-absent-$absent_resource")"
   initialize_mock_state "$workspace/mock-aws-state.json"
@@ -404,7 +536,7 @@ for absent_resource in mapping lambda role queue bucket; do
 done
 printf '   PASS\n'
 
-printf '11. Ambiguous lookup failures remain fatal and preserve state...\n'
+printf '12. Ambiguous lookup failures remain fatal and preserve state...\n'
 for lookup_resource in bucket queue role lambda mapping; do
   workspace="$(new_workspace "lookup-error-$lookup_resource")"
   initialize_mock_state "$workspace/mock-aws-state.json"
@@ -420,7 +552,7 @@ for lookup_resource in bucket queue role lambda mapping; do
 done
 printf '   PASS\n'
 
-printf '12. A second destroy cannot infer targets after state removal...\n'
+printf '13. A second destroy cannot infer targets after state removal...\n'
 workspace="$(new_workspace second-destroy)"
 initialize_mock_state "$workspace/mock-aws-state.json"
 : >"$workspace/mock-aws.log"
@@ -432,7 +564,7 @@ grep -Fq 'Deployment state is missing' "$workspace/second-destroy.out"
 [[ ! -s "$workspace/mock-aws.log" ]]
 printf '   PASS\n'
 
-printf '13. Bash and JSON validation...\n'
+printf '14. Bash and JSON validation...\n'
 while IFS= read -r script; do
   bash -n "$script"
 done < <(

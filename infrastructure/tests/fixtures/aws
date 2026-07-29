@@ -6,6 +6,19 @@ if [[ "${1:-}" == "--version" ]]; then
   exit 0
 fi
 
+if [[ " $* " == *" s3api create-bucket "* &&
+      " $* " == *" --generate-cli-skeleton input "* ]]; then
+  jq -n '{
+    Bucket: "",
+    CreateBucketConfiguration: {
+      LocationConstraint: "",
+      Tags: [{Key:"",Value:""}]
+    },
+    ObjectOwnership: ""
+  }'
+  exit 0
+fi
+
 : "${MOCK_AWS_STATE_FILE:?MOCK_AWS_STATE_FILE is required}"
 : "${MOCK_AWS_LOG_FILE:?MOCK_AWS_LOG_FILE is required}"
 
@@ -99,7 +112,16 @@ case "$service:$operation" in
     exit 255
     ;;
   s3api:create-bucket)
-    state_update '.bucket.exists = true'
+    create_configuration="$(option_value --create-bucket-configuration "$@")"
+    object_ownership="$(option_value --object-ownership "$@")"
+    state_update \
+      '.bucket.exists = true |
+       .bucket.tags = $configuration.Tags |
+       .bucket.location = ($configuration.LocationConstraint // "us-east-1") |
+       .bucket.object_ownership = $object_ownership' \
+      --argjson configuration "$create_configuration" \
+      --arg object_ownership "$object_ownership"
+    fail_after bucket
     printf '{}\n'
     ;;
   s3api:wait|s3api:put-bucket-ownership-controls|s3api:put-public-access-block|s3api:put-bucket-encryption)
@@ -107,7 +129,6 @@ case "$service:$operation" in
   s3api:put-bucket-tagging)
     tagging="$(option_value --tagging "$@")"
     state_update '.bucket.tags = $tags' --argjson tags "$(jq -c '.TagSet' <<<"$tagging")"
-    fail_after bucket
     ;;
   s3api:get-bucket-tagging)
     jq -c '{TagSet:.bucket.tags}' "$MOCK_AWS_STATE_FILE"
@@ -341,26 +362,40 @@ case "$service:$operation" in
     ;;
   lambda:list-event-source-mappings)
     if [[ "$(jq -r '.mapping.exists' "$MOCK_AWS_STATE_FILE")" == true ]]; then
-      jq -c '{EventSourceMappings:[.mapping.configuration]}' "$MOCK_AWS_STATE_FILE"
+      jq -c \
+        '{EventSourceMappings:[(.mapping.configuration + {State:.mapping.state})]}' \
+        "$MOCK_AWS_STATE_FILE"
     else
       printf '{"EventSourceMappings":[]}\n'
     fi
     ;;
   lambda:create-event-source-mapping)
+    initial_mapping_state="${MOCK_MAPPING_INITIAL_STATE:-Creating}"
     mapping_json="$(
       jq -nc \
         --arg queue_arn "$(option_value --event-source-arn "$@")" \
         --arg function_arn "arn:$partition:lambda:$region:$account_id:function:$(option_value --function-name "$@")" \
+        --argjson batching_window "$(option_value --maximum-batching-window-in-seconds "$@")" \
         '{UUID:"phase3-test-mapping",EventSourceArn:$queue_arn,
           FunctionArn:$function_arn,BatchSize:1,
-          FunctionResponseTypes:["ReportBatchItemFailures"]}'
+          MaximumBatchingWindowInSeconds:$batching_window,
+          FunctionResponseTypes:["ReportBatchItemFailures"],
+          FilterCriteria:{Filters:[]},
+          ScalingConfig:{},
+          DestinationConfig:{}}'
     )"
     state_update \
-      '.mapping.exists = true | .mapping.enabled = true |
+      '.mapping.exists = true |
+       .mapping.state = $state |
+       .mapping.state_queries_remaining = $transition_polls |
        .mapping.configuration = $configuration' \
+      --arg state "$initial_mapping_state" \
+      --argjson transition_polls "${MOCK_MAPPING_TRANSITION_POLLS:-1}" \
       --argjson configuration "$mapping_json"
     fail_after mapping
-    printf '{"UUID":"phase3-test-mapping"}\n'
+    jq -c \
+      '.mapping.configuration + {State:.mapping.state}' \
+      "$MOCK_AWS_STATE_FILE"
     ;;
   lambda:get-event-source-mapping)
     lookup_error mapping
@@ -369,21 +404,30 @@ case "$service:$operation" in
       exit 254
     fi
     if [[ " $* " == *" --query State "* ]]; then
-      if [[ "$(jq -r '.mapping.enabled' "$MOCK_AWS_STATE_FILE")" == false ]]; then
-        printf 'Disabled\n'
-      else
-        printf 'Enabled\n'
+      mapping_state="$(jq -r '.mapping.state' "$MOCK_AWS_STATE_FILE")"
+      remaining_polls="$(jq -r '.mapping.state_queries_remaining // 0' "$MOCK_AWS_STATE_FILE")"
+      if [[ "${MOCK_MAPPING_NEVER_ENABLE:-0}" != 1 &&
+            "$mapping_state" =~ ^(Creating|Enabling|Updating)$ &&
+            "$remaining_polls" == "0" ]]; then
+        mapping_state="Enabled"
+        state_update '.mapping.state = "Enabled"'
+      elif [[ "$mapping_state" =~ ^(Creating|Enabling|Updating)$ &&
+              "$remaining_polls" -gt 0 ]]; then
+        state_update '.mapping.state_queries_remaining -= 1'
       fi
+      printf '%s\n' "$mapping_state"
     else
-      jq -c '.mapping.configuration' "$MOCK_AWS_STATE_FILE"
+      jq -c \
+        '.mapping.configuration + {State:.mapping.state}' \
+        "$MOCK_AWS_STATE_FILE"
     fi
     ;;
   lambda:update-event-source-mapping)
-    state_update '.mapping.enabled = false'
+    state_update '.mapping.state = "Disabled"'
     printf '{}\n'
     ;;
   lambda:delete-event-source-mapping)
-    state_update '.mapping.exists = false'
+    state_update '.mapping.exists = false | .mapping.state = "Deleting"'
     printf '{}\n'
     ;;
   lambda:delete-function)
