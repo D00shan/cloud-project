@@ -892,22 +892,38 @@ fi
 DEPLOYMENT_TAG_ID="$(jq -r '.deployment_id' "$STATE_FILE")"
 
 if [[ "$(state_flag '.resources.bucket.created')" != true ]]; then
-  log "Creating private S3 bucket: $BUCKET_NAME"
+  log "Creating private, owned, and atomically tagged S3 bucket: $BUCKET_NAME"
 
-  if [[ "$AWS_REGION" == "us-east-1" ]]; then
-    aws \
-      --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-      s3api create-bucket \
-      --bucket "$BUCKET_NAME" \
-      --output json --no-cli-pager >/dev/null
-  else
-    aws \
-      --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-      s3api create-bucket \
-      --bucket "$BUCKET_NAME" \
-      --create-bucket-configuration "LocationConstraint=$AWS_REGION" \
-      --output json --no-cli-pager >/dev/null
-  fi
+  bucket_create_configuration="$(
+    jq -nc \
+      --arg region "$AWS_REGION" \
+      --arg deployment_id "$DEPLOYMENT_TAG_ID" \
+      --arg project "$PROJECT_NAME" \
+      --arg environment "$ENVIRONMENT" \
+      '
+        {
+          Tags: [
+            {Key:"DeploymentId",Value:$deployment_id},
+            {Key:"Project",Value:$project},
+            {Key:"Environment",Value:$environment}
+          ]
+        }
+        + (
+          if $region == "us-east-1"
+          then {}
+          else {LocationConstraint:$region}
+          end
+        )
+      '
+  )"
+
+  aws \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+    s3api create-bucket \
+    --bucket "$BUCKET_NAME" \
+    --object-ownership BucketOwnerEnforced \
+    --create-bucket-configuration "$bucket_create_configuration" \
+    --output json --no-cli-pager >/dev/null
 
   aws \
     --profile "$AWS_PROFILE" --region "$AWS_REGION" \
@@ -915,24 +931,19 @@ if [[ "$(state_flag '.resources.bucket.created')" != true ]]; then
     --bucket "$BUCKET_NAME" \
     --no-cli-pager
 
-  bucket_tagging="$(
-    jq -nc \
-      --arg deployment_id "$DEPLOYMENT_TAG_ID" \
-      --arg project "$PROJECT_NAME" \
-      --arg environment "$ENVIRONMENT" \
-      '{TagSet:[
-        {Key:"DeploymentId",Value:$deployment_id},
-        {Key:"Project",Value:$project},
-        {Key:"Environment",Value:$environment}
-      ]}'
+  created_bucket_tags="$(
+    aws \
+      --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+      s3api get-bucket-tagging \
+      --bucket "$BUCKET_NAME" \
+      --output json --no-cli-pager
   )"
 
-  aws \
-    --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-    s3api put-bucket-tagging \
-    --bucket "$BUCKET_NAME" \
-    --tagging "$bucket_tagging" \
-    --no-cli-pager
+  verify_tag_array \
+    "$created_bucket_tags" \
+    '.TagSet' \
+    "$DEPLOYMENT_TAG_ID" \
+    || die "Created bucket ownership tags could not be verified: $BUCKET_NAME"
 
   state_update '.resources.bucket.created = true'
 fi

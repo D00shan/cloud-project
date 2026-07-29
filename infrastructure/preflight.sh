@@ -29,6 +29,10 @@ AWS_CLI_VERSION="$(aws --version 2>&1)"
 [[ "$AWS_CLI_VERSION" == aws-cli/2.* ]] \
   || die "AWS CLI v2 is required; found: $AWS_CLI_VERSION"
 
+aws s3api create-bucket --generate-cli-skeleton input \
+  | jq -e '.CreateBucketConfiguration.Tags' >/dev/null \
+  || die "Installed AWS CLI does not support tagging during create-bucket. Upgrade AWS CLI v2 before deploying."
+
 # The configuration file is a local, trusted Bash-style environment file.
 set -a
 
