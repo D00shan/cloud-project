@@ -1,2 +1,22 @@
 node_modules/
 *.zip
+
+# Local infrastructure configuration
+/infrastructure/.env
+
+# Generated policy and configuration files
+/infrastructure/build/*
+!/infrastructure/build/.gitkeep
+
+# Account-specific deployment state
+/infrastructure/state/*
+!/infrastructure/state/.gitkeep
+
+# Installed Lambda dependencies
+/lambdas/*/node_modules/
+
+# Temporary files
+*.tmp
+*.log
+*~
+.DS_Store
