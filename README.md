@@ -48,5 +48,16 @@ AWS SDK: JavaScript v3
 * [x] Document the S3 notification and SQS event source mapping
 * [x] Install AWS CLI v2
 * [x] Configure the AWS CLI safely
-* [ ] Reproduce the current resources through documented CLI commands
+* [ ] Create the clean portable infrastructure directory structure
+* [ ] Add portable deployment configuration and preflight validation
+* [ ] Create portable IAM policy templates
+* [ ] Create portable SQS and S3 configuration templates
+* [ ] Add template rendering and JSON validation
+* [ ] Add repeatable Lambda packaging automation
+* [ ] Implement the AWS CLI deployment steps in dependency order
+* [ ] Implement guarded AWS CLI teardown steps in reverse order
+* [ ] Document deployment, testing, troubleshooting, and teardown
+* [ ] Deploy and test a parallel clean stack
+* [ ] Destroy and recreate the parallel stack to prove reproducibility
+* [ ] Review the portable files for account-specific identifiers
 * [ ] Begin work on the web application
