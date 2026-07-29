@@ -1,0 +1,22 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowConfiguredS3BucketToSendMessages",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "s3.amazonaws.com"
+      },
+      "Action": "sqs:SendMessage",
+      "Resource": "${QUEUE_ARN}",
+      "Condition": {
+        "ArnEquals": {
+          "aws:SourceArn": "${BUCKET_ARN}"
+        },
+        "StringEquals": {
+          "aws:SourceAccount": "${ACCOUNT_ID}"
+        }
+      }
+    }
+  ]
+}
