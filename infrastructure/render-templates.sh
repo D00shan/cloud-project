@@ -11,10 +11,19 @@ TEMPLATE_DIR="$SCRIPT_DIR/config/templates"
 BUILD_DIR="$SCRIPT_DIR/build"
 OUTPUT_DIR="$BUILD_DIR/generated-config"
 staging_directory=""
+previous_output_directory=""
 
 cleanup() {
   if [[ -n "$staging_directory" && -d "$staging_directory" ]]; then
     rm -rf -- "$staging_directory"
+  fi
+
+  if [[ -n "$previous_output_directory" && -e "$previous_output_directory" ]]; then
+    if [[ ! -e "$OUTPUT_DIR" ]]; then
+      mv "$previous_output_directory" "$OUTPUT_DIR"
+    else
+      rm -rf -- "$previous_output_directory"
+    fi
   fi
 }
 
@@ -24,6 +33,7 @@ require_command jq
 require_command grep
 require_command find
 require_command mktemp
+require_command aws
 
 [[ -f "$CONFIG_FILE" ]] \
   || die "Config file not found: $CONFIG_FILE. Copy config/project.env.example to .env first."
@@ -37,62 +47,79 @@ source "$CONFIG_FILE"
 set +a
 
 for variable_name in \
-  ACCOUNT_ID \
-  BUCKET_ARN \
-  QUEUE_ARN \
+  AWS_PROFILE \
+  AWS_REGION \
+  BUCKET_NAME_PREFIX \
+  SQS_QUEUE_NAME \
   INCOMING_PREFIX \
   COMPRESSED_PREFIX; do
 
   require_config_value "$variable_name"
 done
 
-[[ "$ACCOUNT_ID" =~ ^[0-9]{12}$ ]] \
-  || die "ACCOUNT_ID must contain exactly 12 digits."
+validate_aws_region "$AWS_REGION"
+validate_object_prefixes "$INCOMING_PREFIX" "$COMPRESSED_PREFIX"
 
-[[ "$BUCKET_ARN" =~ ^arn:(aws|aws-us-gov|aws-cn):s3:::[a-z0-9][a-z0-9.-]*[a-z0-9]$ ]] \
-  || die "BUCKET_ARN is not a supported S3 bucket ARN: $BUCKET_ARN"
+[[ "$SQS_QUEUE_NAME" =~ ^[A-Za-z0-9_-]{1,80}$ ]] \
+  || die "SQS_QUEUE_NAME must be 1-80 characters using letters, numbers, hyphens, or underscores."
 
-[[ "$QUEUE_ARN" =~ ^arn:(aws|aws-us-gov|aws-cn):sqs:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9_-]+$ ]] \
-  || die "QUEUE_ARN is not a supported SQS queue ARN: $QUEUE_ARN"
+export AWS_PAGER=""
 
-[[ "$QUEUE_ARN" == *":$ACCOUNT_ID:"* ]] \
-  || die "QUEUE_ARN does not belong to ACCOUNT_ID $ACCOUNT_ID."
+log "Deriving portable resource identifiers with AWS profile '$AWS_PROFILE' in region '$AWS_REGION'..."
 
-[[ "$INCOMING_PREFIX" != /* && "$INCOMING_PREFIX" == */ ]] \
-  || die "INCOMING_PREFIX must not begin with / and must end with /."
+if ! IDENTITY_JSON="$(
+  aws \
+    --profile "$AWS_PROFILE" \
+    --region "$AWS_REGION" \
+    sts get-caller-identity \
+    --output json \
+    --no-cli-pager 2>&1
+)"; then
+  die "AWS authentication failed for profile '$AWS_PROFILE': $IDENTITY_JSON"
+fi
 
-[[ "$COMPRESSED_PREFIX" != /* && "$COMPRESSED_PREFIX" == */ ]] \
-  || die "COMPRESSED_PREFIX must not begin with / and must end with /."
+ACCOUNT_ID="$(jq -r '.Account // empty' <<<"$IDENTITY_JSON")"
+CALLER_ARN="$(jq -r '.Arn // empty' <<<"$IDENTITY_JSON")"
 
-[[ "$INCOMING_PREFIX" != "$COMPRESSED_PREFIX" ]] \
-  || die "INCOMING_PREFIX and COMPRESSED_PREFIX must be different."
+validate_account_id "$ACCOUNT_ID"
 
-validate_template_placeholders() {
-  local template_file="$1"
-  local placeholder
-  local placeholders
+[[ -n "$CALLER_ARN" ]] \
+  || die "AWS did not return a caller ARN."
 
-  jq empty "$template_file" >/dev/null 2>&1 \
-    || die "Source template is not valid JSON: $template_file"
+IFS=: read -r \
+  caller_arn_label AWS_PARTITION caller_service caller_region \
+  caller_account_id caller_resource \
+  <<<"$CALLER_ARN"
 
-  placeholders="$(
-    grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*\}' "$template_file" \
-      | sort -u \
-      || true
-  )"
+[[ \
+  "$caller_arn_label" == "arn" &&
+  ( "$caller_service" == "iam" || "$caller_service" == "sts" ) &&
+  -z "$caller_region" &&
+  -n "$caller_resource" \
+]] || die "AWS returned a structurally invalid caller ARN: $CALLER_ARN"
 
-  while IFS= read -r placeholder; do
-    [[ -n "$placeholder" ]] || continue
+validate_aws_partition "$AWS_PARTITION"
 
-    case "$placeholder" in
-      '${BUCKET_ARN}'|'${QUEUE_ARN}'|'${ACCOUNT_ID}'|'${INCOMING_PREFIX}'|'${COMPRESSED_PREFIX}')
-        ;;
-      *)
-        die "Unsupported placeholder $placeholder in template: $template_file"
-        ;;
-    esac
-  done <<<"$placeholders"
-}
+[[ "$caller_account_id" == "$ACCOUNT_ID" ]] \
+  || die "Caller ARN account does not match the authenticated account ID."
+
+BUCKET_NAME="${BUCKET_NAME_PREFIX}-${ACCOUNT_ID}-${AWS_REGION}"
+validate_bucket_name "$BUCKET_NAME"
+
+BUCKET_ARN="arn:$AWS_PARTITION:s3:::$BUCKET_NAME"
+QUEUE_ARN="arn:$AWS_PARTITION:sqs:$AWS_REGION:$ACCOUNT_ID:$SQS_QUEUE_NAME"
+
+validate_bucket_arn_consistency \
+  "$BUCKET_ARN" \
+  "$AWS_PARTITION" \
+  "$BUCKET_NAME"
+
+validate_queue_arn_consistency \
+  "$QUEUE_ARN" \
+  "$AWS_PARTITION" \
+  "$AWS_REGION" \
+  "$ACCOUNT_ID" \
+  "$SQS_QUEUE_NAME"
 
 render_template() {
   local source_file="$1"
@@ -164,14 +191,32 @@ required_generated_files=(
 
 validate_generated_json_directory \
   "$staging_directory" \
+  "$BUCKET_ARN" \
+  "$QUEUE_ARN" \
   "${required_generated_files[@]}"
 
 [[ "$OUTPUT_DIR" == "$SCRIPT_DIR/build/generated-config" ]] \
   || die "Refusing to replace unexpected output directory: $OUTPUT_DIR"
 
-rm -rf -- "$OUTPUT_DIR"
-mv "$staging_directory" "$OUTPUT_DIR"
+if [[ -e "$OUTPUT_DIR" ]]; then
+  previous_output_directory="$BUILD_DIR/.generated-config.previous.$$"
+
+  [[ ! -e "$previous_output_directory" ]] \
+    || die "Refusing to overwrite unexpected backup path: $previous_output_directory"
+
+  mv "$OUTPUT_DIR" "$previous_output_directory"
+fi
+
+if ! mv "$staging_directory" "$OUTPUT_DIR"; then
+  die "Could not publish generated JSON; the previous valid output will be restored."
+fi
+
 staging_directory=""
+
+if [[ -n "$previous_output_directory" ]]; then
+  rm -rf -- "$previous_output_directory"
+  previous_output_directory=""
+fi
 
 log "Rendered and validated JSON configuration:"
 
@@ -179,4 +224,8 @@ for generated_file in "${required_generated_files[@]}"; do
   log "  $OUTPUT_DIR/$generated_file"
 done
 
+log "AWS account: $ACCOUNT_ID"
+log "AWS partition: $AWS_PARTITION"
+log "Bucket ARN: $BUCKET_ARN"
+log "Queue ARN: $QUEUE_ARN"
 log "Rendering completed locally. No AWS resources were changed."

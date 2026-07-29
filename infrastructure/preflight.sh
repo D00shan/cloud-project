@@ -61,8 +61,7 @@ done
 # Configuration validation
 # ---------------------------------------------------------------------------
 
-[[ "$AWS_REGION" =~ ^[a-z0-9]+(-[a-z0-9]+)+$ ]] \
-  || die "AWS_REGION has an invalid format: $AWS_REGION"
+validate_aws_region "$AWS_REGION"
 
 [[ "$PROJECT_NAME" =~ ^[a-z0-9][a-z0-9-]*[a-z0-9]$ ]] \
   || die "PROJECT_NAME must use lowercase letters, numbers, and hyphens."
@@ -82,14 +81,7 @@ done
 [[ "$LAMBDA_ROLE_NAME" =~ ^[A-Za-z0-9+=,.@_-]{1,64}$ ]] \
   || die "LAMBDA_ROLE_NAME contains unsupported characters or is longer than 64 characters."
 
-[[ "$INCOMING_PREFIX" != /* && "$INCOMING_PREFIX" == */ ]] \
-  || die "INCOMING_PREFIX must not begin with / and must end with /."
-
-[[ "$COMPRESSED_PREFIX" != /* && "$COMPRESSED_PREFIX" == */ ]] \
-  || die "COMPRESSED_PREFIX must not begin with / and must end with /."
-
-[[ "$INCOMING_PREFIX" != "$COMPRESSED_PREFIX" ]] \
-  || die "INCOMING_PREFIX and COMPRESSED_PREFIX must be different."
+validate_object_prefixes "$INCOMING_PREFIX" "$COMPRESSED_PREFIX"
 
 require_integer_between SQS_VISIBILITY_TIMEOUT 0 43200
 require_integer_between LAMBDA_MEMORY_SIZE 128 10240
@@ -120,8 +112,7 @@ fi
 ACCOUNT_ID="$(jq -r '.Account // empty' <<<"$IDENTITY_JSON")"
 CALLER_ARN="$(jq -r '.Arn // empty' <<<"$IDENTITY_JSON")"
 
-[[ "$ACCOUNT_ID" =~ ^[0-9]{12}$ ]] \
-  || die "AWS returned an invalid account ID: ${ACCOUNT_ID:-<empty>}"
+validate_account_id "$ACCOUNT_ID"
 
 [[ -n "$CALLER_ARN" ]] \
   || die "AWS did not return a caller ARN."
@@ -131,32 +122,7 @@ CALLER_ARN="$(jq -r '.Arn // empty' <<<"$IDENTITY_JSON")"
 # ---------------------------------------------------------------------------
 
 BUCKET_NAME="${BUCKET_NAME_PREFIX}-${ACCOUNT_ID}-${AWS_REGION}"
-
-(( ${#BUCKET_NAME} >= 3 && ${#BUCKET_NAME} <= 63 )) \
-  || die "Generated bucket name must be 3-63 characters; got ${#BUCKET_NAME}: $BUCKET_NAME"
-
-[[ "$BUCKET_NAME" =~ ^[a-z0-9][a-z0-9.-]*[a-z0-9]$ ]] \
-  || die "Generated bucket name contains invalid characters: $BUCKET_NAME"
-
-[[ "$BUCKET_NAME" != *..* ]] \
-  || die "Generated bucket name cannot contain adjacent periods: $BUCKET_NAME"
-
-[[ ! "$BUCKET_NAME" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] \
-  || die "Generated bucket name cannot look like an IP address: $BUCKET_NAME"
-
-[[ \
-  "$BUCKET_NAME" != xn--* &&
-  "$BUCKET_NAME" != sthree-* &&
-  "$BUCKET_NAME" != amzn-s3-demo-* \
-]] || die "Generated bucket name uses an AWS-reserved prefix: $BUCKET_NAME"
-
-[[ \
-  "$BUCKET_NAME" != *-s3alias &&
-  "$BUCKET_NAME" != *--ol-s3 &&
-  "$BUCKET_NAME" != *.mrap &&
-  "$BUCKET_NAME" != *--x-s3 &&
-  "$BUCKET_NAME" != *--table-s3 \
-]] || die "Generated bucket name uses an AWS-reserved suffix: $BUCKET_NAME"
+validate_bucket_name "$BUCKET_NAME"
 
 log "AWS account: $ACCOUNT_ID"
 log "Caller ARN:  $CALLER_ARN"

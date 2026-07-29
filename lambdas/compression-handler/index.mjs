@@ -134,11 +134,6 @@ async function compressObject(s3Record) {
   const deleteParams = {
     Bucket: bucketName,
     Key: key,
-
-    // Delete the exact source version when bucket versioning is enabled.
-    ...(response.VersionId
-      ? { VersionId: response.VersionId }
-      : {}),
   };
 
   console.log("Source file deletion started", deleteParams);

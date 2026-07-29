@@ -19,7 +19,7 @@ names.
 - `validate.sh` — validates configuration and generated files
 - `destroy.sh` — removes infrastructure in reverse dependency order
 - `preflight.sh` — verifies local dependencies, configuration, AWS identity, selected region, and bucket-name availability without modifying AWS resources
-- `render-templates.sh` — renders and validates portable JSON configuration without calling AWS
+- `render-templates.sh` — derives identifiers, then renders and validates portable JSON configuration
 
 ## Policy and integration templates
 
@@ -38,27 +38,29 @@ part of Phase 3 and is not performed by the renderer.
 
 ## Render and validate templates
 
-The renderer reads `infrastructure/.env` by default for the configured prefixes.
-The future deployment workflow must also supply its derived `ACCOUNT_ID`,
-`BUCKET_ARN`, and `QUEUE_ARN` values explicitly:
+The renderer reads `infrastructure/.env` by default:
 
 ```bash
-ACCOUNT_ID=123456789012 \
-BUCKET_ARN=arn:aws:s3:::example-portable-bucket \
-QUEUE_ARN=arn:aws:sqs:us-east-1:123456789012:example-portable-queue \
 ./infrastructure/render-templates.sh
 ```
 
-An explicit config path can be passed as the first argument. The renderer only
-supports the placeholders `BUCKET_ARN`, `QUEUE_ARN`, `ACCOUNT_ID`,
-`INCOMING_PREFIX`, and `COMPRESSED_PREFIX`. It uses JSON-aware substitution,
-rejects unsupported or unresolved placeholders, and validates every generated
-document before replacing the previous output.
+An explicit config path can be passed as the first argument. Using its configured
+AWS profile and region, the renderer calls only `aws sts get-caller-identity`.
+It derives the account ID and partition from that response, builds the bucket
+name from `BUCKET_NAME_PREFIX`, account ID, and region, and constructs the
+bucket and queue ARNs locally. This identity lookup is read-only and does not
+create or modify AWS resources.
+
+The renderer only supports the placeholders `BUCKET_ARN`, `QUEUE_ARN`,
+`ACCOUNT_ID`, `INCOMING_PREFIX`, and `COMPRESSED_PREFIX`. It uses JSON-aware
+substitution, rejects unsupported or unresolved placeholders, validates ARN
+consistency and every generated document, and preserves the previous valid
+output if a new render fails.
 
 Deployment-ready JSON is written to `build/generated-config/`. Source templates
 are never modified, and everything under `build/` is ignored by Git and must not
-be committed. Rendering and JSON validation are local preparation steps; they
-do not deploy or modify AWS resources.
+be committed. Rendering and JSON validation are preparation steps; the renderer
+performs a read-only identity lookup but does not deploy or modify AWS resources.
 
 ## Preflight check
 

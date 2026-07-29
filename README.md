@@ -49,10 +49,10 @@ AWS SDK: JavaScript v3
 * [x] Install AWS CLI v2
 * [x] Configure the AWS CLI safely
 * [x] Create the clean portable infrastructure directory structure
-* [ ] Add portable deployment configuration and preflight validation
-* [ ] Create portable IAM policy templates
-* [ ] Create portable SQS and S3 configuration templates
-* [ ] Add template rendering and JSON validation
+* [x] Add portable deployment configuration and preflight validation
+* [x] Create portable IAM policy templates
+* [x] Create portable SQS and S3 configuration templates
+* [x] Add template rendering and JSON validation
 * [ ] Add repeatable Lambda packaging automation
 * [ ] Implement the AWS CLI deployment steps in dependency order
 * [ ] Implement guarded AWS CLI teardown steps in reverse order

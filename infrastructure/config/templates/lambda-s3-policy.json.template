@@ -6,8 +6,7 @@
       "Effect": "Allow",
       "Action": [
         "s3:GetObject",
-        "s3:DeleteObject",
-        "s3:DeleteObjectVersion"
+        "s3:DeleteObject"
       ],
       "Resource": "${BUCKET_ARN}/${INCOMING_PREFIX}*"
     },
