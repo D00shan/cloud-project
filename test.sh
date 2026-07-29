@@ -9,3 +9,4 @@ SCRIPT_DIR="$(
 "$SCRIPT_DIR/infrastructure/tests/phase3-safety-tests.sh"
 "$SCRIPT_DIR/infrastructure/tests/lambda-tests.sh"
 "$SCRIPT_DIR/infrastructure/tests/phase4-validation-tests.sh"
+"$SCRIPT_DIR/infrastructure/tests/portability-audit-tests.sh"

@@ -247,7 +247,7 @@ jq -e \
     .QueueConfigurations[0].QueueArn == $queue_arn and
     .QueueConfigurations[0].Events == ["s3:ObjectCreated:*"] and
     .QueueConfigurations[0].Filter.Key.FilterRules ==
-      [{Name:"Prefix",Value:$incoming}] and
+      [{Name:"prefix",Value:$incoming}] and
     (.QueueConfigurations[0].Filter.Key.FilterRules |
       all(.Value != $compressed))
   ' <<<"$notification" >/dev/null \

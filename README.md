@@ -9,18 +9,17 @@ University project demonstrating an event-driven architecture using:
 ## Current architecture
 1. User uploads a file into `incoming/` in S3.
 2. S3 sends an ObjectCreated event directly to SQS.
-3. SQS triggers the FileCompressionHandler Lambda.
+3. SQS triggers the configured compression Lambda.
 4. Lambda downloads and gzip-compresses the object.
 5. Lambda uploads it into `compressed/`.
 6. Lambda deletes the original file.
 
 ## AWS details
-Region: us-east-1
-Bucket: cloud-project-file-sharing-bucket
-Queue: file-compression-queue
-Compression Lambda: FileCompressionHandler
-Runtime: Node.js
-AWS SDK: JavaScript v3
+
+The region and deterministic resource names come from
+`infrastructure/.env`; account and partition values are derived from the
+authenticated AWS CLI identity. The compression function uses Node.js and AWS
+SDK for JavaScript v3.
 
 ## Requirements
 - Infrastructure must also be reproducible through AWS CLI.
@@ -40,8 +39,7 @@ AWS SDK: JavaScript v3
 
 ## Portable AWS CLI workflow
 
-Keep the original working stack untouched. Configure distinct names for a
-parallel disposable rehearsal:
+Use distinct names and an isolated environment for a disposable rehearsal:
 
 ```bash
 cp infrastructure/config/project.env.example infrastructure/.env
@@ -61,25 +59,3 @@ beginner guides and the uncompleted rehearsal evidence checklist are indexed in
 not prove real AWS portability; only two successful disposable AWS cycles do.
 
 # Project TODO
-
-* [x] Rename `index.js` to `index.mjs`
-* [x] Add `package.json` and install the Lambda dependencies
-* [x] Test the corrected Lambda package locally and in AWS
-* [x] Copy the current Lambda configuration into the project documentation
-* [x] Copy all current IAM policies into JSON files
-* [x] Document the S3 notification and SQS event source mapping
-* [x] Install AWS CLI v2
-* [x] Configure the AWS CLI safely
-* [x] Create the clean portable infrastructure directory structure
-* [x] Add portable deployment configuration and preflight validation
-* [x] Create portable IAM policy templates
-* [x] Create portable SQS and S3 configuration templates
-* [x] Add template rendering and JSON validation
-* [x] Add repeatable Lambda packaging automation
-* [x] Implement the AWS CLI deployment steps in dependency order
-* [x] Implement guarded AWS CLI teardown steps in reverse order
-* [x] Document deployment, testing, troubleshooting, and teardown
-* [ ] Deploy and test a parallel clean stack
-* [ ] Destroy and recreate the parallel stack to prove reproducibility
-* [x] Review the portable files for account-specific identifiers
-* [ ] Begin work on the web application

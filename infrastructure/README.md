@@ -88,9 +88,6 @@ create-then-tag fallback: ownership tags must be part of `CreateBucket` so an
 interruption cannot leave an untagged bucket that looks adoptable. Upgrade AWS
 CLI v2 if this capability check fails.
 
-The original manually created AWS environment is documented separately under
-`docs/current-aws-state/`.
-
 ## Package the Lambda
 
 ```bash
@@ -105,9 +102,8 @@ dependencies in the source directory.
 
 ## Deploy
 
-> **Safety warning:** Keep the original manually created infrastructure
-> untouched. The first real CLI deployment must use a separate temporary
-> environment and distinct resource names.
+> **Safety warning:** The first real CLI deployment must use a disposable
+> environment and resource names that do not collide with other stacks.
 
 After copying and reviewing `.env`, deploy with:
 
@@ -128,7 +124,7 @@ cp infrastructure/config/project.env.example infrastructure/.env
 ```
 
 Use separate temporary names, confirm teardown, and repeat deploy, validation,
-and destruction from empty state. Do not modify the original stack.
+and destruction from empty state.
 
 Deployment runs preflight, renders JSON, packages the Lambda, and then creates
 the private S3 bucket, SQS queue, Lambda execution role, Lambda function, event
