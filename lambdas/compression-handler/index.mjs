@@ -20,8 +20,19 @@ function decodeS3Key(encodedKey) {
 function normalizeETag(eTag) {
   return String(eTag ?? "")
     .trim()
-    .replace(/^"+|"+$/g, "")
-    .toLowerCase();
+    .replace(/^"+|"+$/g, "");
+}
+
+function formatETagCondition(eTag) {
+  return `"${normalizeETag(eTag)}"`;
+}
+
+function isPreconditionFailedError(error) {
+  return (
+    error?.name === "PreconditionFailed" ||
+    error?.Code === "PreconditionFailed" ||
+    error?.$metadata?.httpStatusCode === 412
+  );
 }
 
 function isNotFoundError(error) {
@@ -130,13 +141,35 @@ async function compressObject(s3Record, { s3Client, UploadClass }) {
   }
 
   async function deleteSourceObject() {
-    return s3Client.send(
+  try {
+    return await s3Client.send(
       new DeleteObjectCommand({
         Bucket: bucketName,
         Key: key,
+        IfMatch: formatETagCondition(eventETag),
       })
     );
+  } catch (error) {
+    if (isNotFoundError(error)) {
+      return { alreadyAbsent: true };
+    }
+
+    if (isPreconditionFailedError(error)) {
+      console.warn(
+        "Source object changed before deletion; leaving replacement untouched",
+        {
+          bucketName,
+          key,
+          expectedETag: eventETag,
+        }
+      );
+
+      return { sourceChanged: true };
+    }
+
+    throw error;
   }
+}
 
   const existingDestination = await headCompressedObject();
 
@@ -165,9 +198,25 @@ async function compressObject(s3Record, { s3Client, UploadClass }) {
       new GetObjectCommand({
         Bucket: bucketName,
         Key: key,
+        IfMatch: formatETagCondition(eventETag),
       })
     );
   } catch (error) {
+    if (isPreconditionFailedError(error)) {
+      console.warn("Skipping stale S3 event because the source object changed", {
+        bucketName,
+        key,
+        expectedETag: eventETag,
+      });
+
+      return {
+        skipped: true,
+        bucket: bucketName,
+        sourceKey: key,
+        reason: "Source object changed after this event was emitted",
+      };
+    }
+
     if (!isNotFoundError(error)) {
       throw error;
     }

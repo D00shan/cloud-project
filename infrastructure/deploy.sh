@@ -127,8 +127,25 @@ validate_event_source_mapping_json() {
       (.FunctionArn == $function_arn or
        .FunctionArn == ($function_arn + ":$LATEST")) and
       .BatchSize == 1 and
+      (.MaximumBatchingWindowInSeconds // 0) == 0 and
       .FunctionResponseTypes == ["ReportBatchItemFailures"]
     ' <<<"$mapping_json" >/dev/null
+}
+
+validate_event_source_mapping_state() {
+  local mapping_state="$1"
+
+  case "$mapping_state" in
+    Enabled|Creating|Enabling|Updating)
+      return 0
+      ;;
+    Disabled|Disabling|Deleting|Failed)
+      return 1
+      ;;
+    *)
+      return 2
+      ;;
+  esac
 }
 
 verify_tag_array() {
@@ -712,6 +729,15 @@ if [[ "$RESUMING" == true ]]; then
       )"
       validate_event_source_mapping_json "$recorded_mapping_json" \
         || die "Resource collision: recorded event-source mapping configuration differs."
+      recorded_mapping_state="$(
+        jq -r '.State // empty' <<<"$recorded_mapping_json"
+      )"
+
+      if ! validate_event_source_mapping_state "$recorded_mapping_state"; then
+        die "Resource collision: recorded event-source mapping is in incompatible state '$recorded_mapping_state'."
+      fi
+
+      state_update '.steps.event_source_mapping_enabled = false'
     else
       existing_mappings="$(
         aws --profile "$AWS_PROFILE" --region "$AWS_REGION" \
@@ -730,8 +756,28 @@ if [[ "$RESUMING" == true ]]; then
         [[ -n "$adopted_mapping_uuid" ]] \
           || die "Existing event-source mapping returned no UUID."
         state_update \
-          '.resources.event_source_mapping_uuid = $uuid |
-           .steps.event_source_mapping_enabled = true' \
+          'validate_event_source_mapping_json "$matching_mapping" \
+  || die "Resource collision: unrecorded event-source mapping configuration differs."
+
+adopted_mapping_state="$(
+  jq -r '.State // empty' <<<"$matching_mapping"
+)"
+
+if ! validate_event_source_mapping_state "$adopted_mapping_state"; then
+  die "Resource collision: unrecorded event-source mapping is in incompatible state '$adopted_mapping_state'."
+fi
+
+adopted_mapping_uuid="$(jq -r '.UUID // empty' <<<"$matching_mapping")"
+
+[[ -n "$adopted_mapping_uuid" ]] \
+  || die "Existing event-source mapping returned no UUID."
+
+state_update \
+  '.resources.event_source_mapping_uuid = $uuid |
+   .steps.event_source_mapping_enabled = false' \
+  --arg uuid "$adopted_mapping_uuid"
+
+log "Adopted exactly matching SQS-to-Lambda mapping into deployment state."' \
           --arg uuid "$adopted_mapping_uuid"
         log "Adopted exactly matching SQS-to-Lambda mapping into deployment state."
       elif (( mapping_count > 1 )); then
@@ -1182,15 +1228,21 @@ for attempt in {1..60}; do
       --query State --output text --no-cli-pager
   )"
 
-  if [[ "$mapping_state" == "Enabled" ]]; then
-    mapping_enabled=true
-    break
-  fi
-
-  [[ "$mapping_state" != "Failed" ]] \
-    || die "SQS-to-Lambda event-source mapping entered Failed state."
-
-  sleep 5
+  case "$mapping_state" in
+    Enabled)
+      mapping_enabled=true
+      break
+      ;;
+    Creating|Enabling|Updating)
+      sleep 5
+      ;;
+    Disabled|Disabling|Deleting|Failed)
+      die "SQS-to-Lambda event-source mapping entered incompatible state '$mapping_state'."
+      ;;
+    *)
+      die "SQS-to-Lambda event-source mapping returned unexpected state '$mapping_state'."
+      ;;
+  esac
 done
 
 [[ "$mapping_enabled" == true ]] \
