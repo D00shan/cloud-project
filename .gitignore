@@ -20,7 +20,3 @@ node_modules/
 *.log
 *~
 .DS_Store
-
-/context/*
-
-check.sh

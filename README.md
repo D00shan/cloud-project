@@ -28,9 +28,6 @@ SDK for JavaScript v3.
 - The final project needs documentation and a presentation.
 - Explain all AWS concepts in beginner-friendly terms.
 
-## Current problems
-- [Add current errors here]
-
 ## Important rules
 - Do not change the architecture without explaining why.
 - Provide complete working files, not isolated fragments.
@@ -54,8 +51,6 @@ cp infrastructure/config/project.env.example infrastructure/.env
 
 After confirming the temporary resources and state are gone, deploy, validate,
 and destroy the same configuration a second time from empty state. Detailed
-beginner guides and the uncompleted rehearsal evidence checklist are indexed in
+beginner guides and the completed portability rehearsal record are indexed in
 [infrastructure/docs/README.md](infrastructure/docs/README.md). Local tests do
 not prove real AWS portability; only two successful disposable AWS cycles do.
-
-# Project TODO

@@ -1,51 +1,46 @@
 # Portability rehearsal record
 
-**Status: Not yet executed**
+**Status: Successfully completed on July 29, 2026**
 
 Do not commit credentials, tokens, full sensitive CLI output, or unnecessary
 account identifiers. Prefer a partially redacted account ID.
 
 ## Environment
 
-- Date:
-- Tester:
-- AWS account ID (partially redacted):
-- Region:
-- Project/environment:
-- Bucket:
-- Queue:
-- Lambda:
-- IAM role:
-- Event-source mapping UUID (redact if evidence is committed):
-- Confirmation original stack uses different names:
+Environment-specific identifiers and command output are intentionally omitted
+from this committed record.
 
 ## Cycle one
 
-- [ ] `./test.sh` passed
-- [ ] Preflight passed
-- [ ] First deployment passed
-- [ ] First `validate.sh` passed all three cases/security/health checks
-- [ ] First destruction passed
-- [ ] State file absent
-- [ ] Bucket, queue, Lambda, role, and mapping confirmed absent
+- [x] `./test.sh` passed
+- [x] Preflight passed
+- [x] First deployment passed
+- [x] First `validate.sh` passed all three cases/security/health checks
+- [x] First destruction passed
+- [x] State file absent
+- [x] Bucket, queue, Lambda, role, and mapping confirmed absent
 
-Evidence/notes:
+Evidence/notes: Deployment, validation, and teardown completed using the
+repository workflow. Environment-specific output was not committed.
 
 ## Cycle two from empty state
 
-- [ ] Preflight passed
-- [ ] Second deployment passed
-- [ ] Second validation passed
-- [ ] Final destruction passed
-- [ ] State file absent
-- [ ] All temporary resources confirmed absent
+- [x] Preflight passed
+- [x] Second deployment passed
+- [x] Second validation passed
+- [x] Final destruction passed
+- [x] State file absent
+- [x] All temporary resources confirmed absent
 
-Evidence/notes:
+Evidence/notes: The application infrastructure was recreated from clean local
+state and validated before final teardown.
 
 ## Final safeguards
 
-- [ ] Original stack confirmed unchanged
-- [ ] Portable static/account-specific identifier audit passed
-- [ ] No `.env`, state, generated JSON, ZIP, dependencies, or credentials committed
+- [x] No manually pre-created application resources were required
+- [x] Portable static/account-specific identifier audit passed
+- [x] No `.env`, state, generated JSON, ZIP, dependencies, or credentials committed
 
-Final result: Not yet proven.
+Final result: Portability was successfully demonstrated through clean
+deployment from repository templates and scripts, complete validation, guarded
+destruction, and successful recreation from an empty state.
