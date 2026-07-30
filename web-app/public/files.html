@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Recent files · Cloud File Compressor</title>
+    <link rel="stylesheet" href="/css/styles.css">
+    <script type="module" src="/js/files.js"></script>
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="/upload.html">Cloud File Compressor</a>
+      <nav aria-label="Main navigation">
+        <a href="/upload.html">Upload</a>
+        <a aria-current="page" href="/files.html">Recent files</a>
+      </nav>
+    </header>
+
+    <main class="page-shell">
+      <section class="page-heading">
+        <div>
+          <p class="eyebrow">Live processing status</p>
+          <h1>Recent files</h1>
+          <p>Ready files can be downloaded as private, short-lived links.</p>
+        </div>
+        <button id="refresh-button" class="secondary-button" type="button">
+          Refresh
+        </button>
+      </section>
+
+      <div id="files-message" class="message" role="status" aria-live="polite">
+        Loading recent files…
+      </div>
+      <section id="files-list" class="file-list" aria-label="Recent uploads"></section>
+    </main>
+  </body>
+</html>

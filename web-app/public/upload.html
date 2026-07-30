@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Upload a file · Cloud File Compressor</title>
+    <link rel="stylesheet" href="/css/styles.css">
+    <script type="module" src="/js/upload.js"></script>
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="/upload.html">Cloud File Compressor</a>
+      <nav aria-label="Main navigation">
+        <a aria-current="page" href="/upload.html">Upload</a>
+        <a href="/files.html">Recent files</a>
+      </nav>
+    </header>
+
+    <main class="page-shell">
+      <section class="hero">
+        <p class="eyebrow">Private S3 workflow</p>
+        <h1>Compress a file in the cloud</h1>
+        <p>
+          Choose one file. It will be uploaded securely, processed in the
+          background, and made available as a gzip download.
+        </p>
+      </section>
+
+      <section class="panel upload-panel" aria-labelledby="upload-heading">
+        <h2 id="upload-heading">Choose your file</h2>
+        <form id="upload-form" enctype="multipart/form-data">
+          <label class="file-picker" for="file-input">
+            <span>Select a file</span>
+            <input id="file-input" name="file" type="file" required>
+          </label>
+          <div id="selection" class="selection" aria-live="polite">
+            No file selected
+          </div>
+          <button id="upload-button" class="primary-button" type="submit">
+            Upload for compression
+          </button>
+        </form>
+        <div id="message" class="message" role="status" aria-live="polite"></div>
+      </section>
+    </main>
+  </body>
+</html>
